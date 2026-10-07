@@ -1,0 +1,529 @@
+.lac-widget {
+	position: fixed;
+	bottom: 15vh;
+	right: 4vh;
+	z-index: 2;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Media query para evitar que tape botón de Whatsapp de Cotizaciones (pantallas de 768px o menos) */
+@media (max-width: 768px) {
+    .lac-widget {
+        bottom: 12vh;
+        right: 2vh;
+        z-index: 2;
+    }
+}
+
+.lac-toggle-btn {
+	display: flex;
+	align-items: center;
+	gap: 1px;
+	padding: 14px 17px;
+	border: none;
+	border-radius: 999px;
+	background: linear-gradient(90deg, #ff0000, #2700ff 190%); /* ajusta al color de marca de Limatco */
+	color: #fff;
+	font-size: 14px;
+	font-weight: 600;
+	cursor: pointer;
+	box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+	transition: transform 0.15s ease;
+}
+.lac-toggle-btn:hover {
+	transform: scale(1.04);
+}
+
+.lac-chat-window {
+	position: absolute;
+    bottom: 64px;
+    right: 0;
+    width: 45vw;
+    max-width: 150vw;
+    height: 55vh;
+    max-height: 100vh;
+    background: #fff;
+    border-radius: 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.lac-chat-header {
+	background: linear-gradient(90deg, #ff0000, #2700ff 190%);
+	color: #fff;
+	padding: 12px 16px;
+	font-weight: 600;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+}
+
+.lac-close-btn {
+	background: none;
+	border: none;
+	color: #fff;
+	font-size: 15px;
+	line-height: 1;
+	cursor: pointer;
+	padding: 1px;
+
+}
+
+/* el padding en messages es para dejar un espacio en el chat para que la persona cuando el chat le entregó respuesta sin estar tapada por el placeholder input */
+.lac-messages {
+	flex: 1;
+	overflow-y: auto;
+	overflow-anchor: auto;
+	padding: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	background: #f7f7f8;
+	padding-bottom: 9vh; 
+}
+
+.lac-msg {
+	max-width: 85%;
+	padding: 8px 12px;
+	border-radius: 12px;
+	font-size: 13.5px;
+	line-height: 1.4;
+	white-space: pre-wrap;
+}
+
+.lac-msg.user {
+	align-self: flex-end;
+	background: #0f7a3c;
+	color: #fff;
+	border-bottom-right-radius: 2px;
+}
+
+.lac-msg.assistant {
+	align-self: flex-start;
+	background: #ececec;
+	color: #222;
+	border-bottom-left-radius: 2px;
+}
+
+.lac-msg.assistant.lac-loading {
+	font-style: normal;
+	opacity: 1;
+	background: transparent;
+	padding: 4px 0;
+	box-shadow: none;
+	border: none;
+}
+
+/* Burbujas de "pensando" */
+.lac-typing-dots {
+	display: flex;
+	gap: 5px;
+	align-items: center;
+	padding: 10px 14px;
+	background: #ececec;
+	border-radius: 12px;
+	border-bottom-left-radius: 2px;
+	width: fit-content;
+}
+.lac-typing-dots span {
+	display: block;
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: #999;
+	animation: lac-bounce 1.2s infinite ease-in-out;
+}
+.lac-typing-dots span:nth-child(1) { animation-delay: 0s; }
+.lac-typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.lac-typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes lac-bounce {
+	0%, 80%, 100% { transform: scale(0.7); opacity: 0.5; }
+	40%            { transform: scale(1);   opacity: 1; }
+}
+
+/* Typing animation en el texto de respuesta */
+.lac-msg.assistant.lac-typing-text {
+	overflow: hidden;
+	white-space: pre-wrap;
+	border-right: 2px solid #555;
+	animation: lac-cursor-blink 0.6s step-end infinite;
+}
+.lac-msg.assistant.lac-typing-text.lac-typing-done {
+	border-right: none;
+	animation: none;
+}
+
+@keyframes lac-cursor-blink {
+	0%, 100% { border-color: #555; }
+	50%       { border-color: transparent; }
+}
+
+/* Tarjetas de producto (imagen, precio, stock, oferta) */
+.lac-products {
+	display: grid;
+    flex-direction: column;
+    gap: 8px;
+    grid-template-columns: repeat(1, 1fr);
+    align-self: stretch;
+}
+
+/* Columnas de productos responsive, 2 columnas en PC y 1 columna en smarthphones */
+@media (min-width: 768px) {
+  .lac-products {
+	grid-template-columns: repeat(2, 1fr);
+}}
+
+.lac-product-card {
+	position: relative;
+	display: flex;
+	gap: 12px;
+	align-items: flex-start;
+	background: #fff;
+	border: 1px solid #e5e5e5;
+	border-radius: 10px;
+	padding: 10px;
+	text-decoration: none;
+	color: inherit;
+	transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.lac-product-card:hover {
+	border-color: #0f7a3c;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+.lac-product-image {
+	flex: 0 0 auto;
+	width: 100px;
+	height: 100px;
+	border-radius: 8px;
+	overflow: hidden;
+	background: #f2f2f2;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.lac-product-image img {
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+	display: block;
+}
+
+.lac-product-info {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.lac-product-brand {
+	font-size: 9px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: #8a8a8a;
+	margin-bottom: -2px;
+}
+
+.lac-product-name {
+	font-size: 13px;
+	font-weight: 600;
+	color: #222;
+	line-height: 1.3;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+}
+
+.lac-product-sku {
+	font-size: 10px;
+	color: #8a8a8a;
+	line-height: 1.2;
+	margin-top: -2px;
+}
+
+.lac-product-price {
+	font-size: 17px;
+	font-weight: 700;
+	color: #0f7a3c;
+	line-height: 1.2;
+}
+
+.lac-product-regular-price {
+	font-size: 12px;
+	color: #999;
+	text-decoration: line-through;
+	line-height: 0.5;
+}
+
+.lac-sale-box {
+	display: inline-block;
+	width: fit-content;
+	border: 1px solid #e0263e;
+	border-radius: 6px;
+	padding: 2px 8px;
+	font-size: 11px;
+	font-weight: 700;
+	color: #e0263e;
+	margin-top: 4px;
+}
+
+.lac-badge {
+	display: inline-block;
+	width: fit-content;
+	font-size: 10.5px;
+	font-weight: 700;
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+	padding: 2px 7px;
+	border-radius: 999px;
+}
+
+.lac-badge-stock.in-stock {
+	background: #e5f5ec;
+	color: #0f7a3c;
+}
+
+.lac-badge-stock.out-of-stock {
+	background: #f5e5e5;
+	color: #b3261e;
+}
+
+/* Botón de "agregar al carrito" en la sección de abajo de cada tarjeta. */
+.lac-add-cart-btn {
+	background: #0f7a3c;
+    color: #fff;
+    margin-left: 1px;
+    align-self: center;
+    margin-top: 4px;
+    font-size: 13.5px;
+    font-weight: 700;
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+	border: none;
+}
+.lac-add-cart-btn:hover {
+	opacity: 0.9;
+}
+.lac-add-cart-btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.lac-card-btn-row {
+	display: flex;
+	gap: 6px;
+	align-items: center;
+	flex-wrap: wrap;
+	margin-top: 4px;
+}
+
+.lac-view-btn {
+	margin-left: 6px;
+    align-self: auto;
+    margin-top: 4px;
+    background: #00364b;
+    color: white;
+    font-size: 13.5px;
+    font-weight: 700;
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    text-decoration: none;
+}
+.lac-view-btn:hover {
+	background: #026085;
+	color: #fff;
+}
+
+.lac-form {
+	display: flex;
+	border-top: 1px solid #e5e5e5;
+	padding: 8px;
+	gap: 8px;
+}
+
+
+.lac-input {
+	flex: 1;
+	border: 1px solid #ddd;
+	border-radius: 20px;
+	padding: 8px 14px;
+	font-size: 13.5px;
+	outline: none;
+}
+.lac-input:focus {
+	border-color: #0f7a3c;
+}
+
+.lac-send-btn {
+	border: none;
+	background: #0f7a3c;
+	color: #fff;
+	width: 50px;
+	height: 50px;
+	border-radius: 50%;
+	cursor: pointer;
+	font-size: 25px;
+    padding: 1px;
+}
+
+@media (max-width: 480px) {
+	.lac-chat-window {
+		width: 92vw;
+		right: -4px;
+        height: 50vh;
+	}
+}
+
+/* Captcha checkbox */
+.lac-captcha-overlay {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 14px 16px;
+	border-top: 1px solid #e5e5e5;
+	background: #f7f7f8;
+}
+.lac-captcha-label {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	cursor: pointer;
+	font-size: 13.5px;
+	color: #333;
+	font-weight: 500;
+	user-select: none;
+}
+.lac-captcha-sr {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	padding: 0;
+	border: 0;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+}
+.lac-captcha-box {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	border: 2px solid #bbb;
+	border-radius: 4px;
+	background: #fff;
+	flex-shrink: 0;
+	transition: border-color 0.2s, background 0.2s;
+}
+
+.lac-captcha-box.lac-captcha-checked {
+	border-color: #0f7a3c;
+	background: #0f7a3c;
+}
+.lac-captcha-box.lac-captcha-checked::after {
+	content: '';
+	display: block;
+	width: 6px;
+	height: 11px;
+	border: 2px solid #fff;
+	border-top: none;
+	border-left: none;
+	transform: rotate(45deg) translateY(-1px);
+}
+.lac-captcha-label:hover .lac-captcha-box {
+	border-color: #0f7a3c;
+}
+
+/* Contador de caracteres */
+.lac-char-counter {
+	font-size: 10px;
+	color: #aaa;
+	text-align: right;
+	padding: 0 10px 4px;
+	line-height: 1;
+}
+.lac-char-counter.lac-char-warn { color: #b3261e; }
+
+
+/* ── Tarjeta "¿Quieres ver más?" ─────────────────────────────────────────── */
+.lac-see-more-card {
+	background: #fff;
+	border: 1px solid #e5e5e5;
+	border-radius: 10px;
+	padding: 12px 14px;
+	align-self: stretch;
+}
+
+.lac-see-more-title {
+	font-size: 12px;
+	font-weight: 700;
+	color: #555;
+	margin: 0 0 8px 0;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.lac-see-more-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+/* Botón categoría: fondo verde Limatco */
+.lac-see-more-link {
+	display: inline-block;
+	padding: 6px 14px;
+	border-radius: 20px;
+	font-size: 12px;
+	font-weight: 600;
+	text-decoration: none;
+	white-space: nowrap;
+	transition: opacity 0.15s;
+}
+.lac-see-more-link:hover { opacity: 0.85; }
+/* Categoría: Color verde */
+.lac-see-more-cat {
+	background: #0f7a3c;
+	color: #fff;
+}
+
+/* Query sola: Color gris */
+.lac-see-more-query {
+	background: #444;
+	color: #fff;
+}
+.lac-see-more-query:hover { opacity: 0.85; }
+
+/* Categoría + query combinado: borde verde */
+.lac-see-more-combined {
+	border: 1.5px solid #0f7a3c;
+	background: #fff;
+	color: #0f7a3c;
+}
+.lac-see-more-combined:hover {
+	background: #0f7a3c;
+	color: #fff;
+}
+
+/* Fallback attr (por compatibilidad) */
+.lac-see-more-attr {
+	border: 1.5px solid #e0263e;
+	background: #fff;
+	color: #e0263e;
+}
+.lac-see-more-attr:hover {
+	background: #e0263e;
+	color: #fff;
+}
+

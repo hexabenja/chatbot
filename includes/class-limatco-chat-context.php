@@ -1,0 +1,1231 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Construye el bloque de contexto a partir de una búsqueda dinámica en
+ * WooCommerce (no de un catálogo estático). Se llama en cada mensaje,
+ * con la categoría/keywords ya detectados por Limatco_Chat_Api::classify_query().
+ */
+class Limatco_Chat_Context {
+
+	const MAX_PRODUCTS = 6;
+
+	// Tamaño del pool de candidatos que se trae por cada término buscado, antes de
+	// combinar/mezclar en PHP y recortar a MAX_PRODUCTS. COSIDERAR REMOVER EN POSTERIORES VERSIONES DEBIDO A QUE COMO YA ESTÁ ORDERY BY SE PODRÍA OPTIMIZAR MÁS EL TIEMPO DE RESPONSE.
+	const SHUFFLE_POOL_SIZE = 30;
+
+	// Umbral de "stock bajo" para la opción "excluir productos con poco stock" (lac_exclude_low_stock).
+	const LOW_STOCK_THRESHOLD = 20;
+
+	/** true si el admin activó "no mostrar productos con stock menor a 20" (lac_exclude_low_stock). */
+	private static function exclude_low_stock_enabled() {
+		return '1' === (string) get_option( 'lac_exclude_low_stock', '0' );
+	}
+
+	// Slugs de los Atributos de WooCommerce del catálogo (confirmados en wp-admin ->
+	// Productos -> Atributos, ~1773/1993 productos los tienen cargados) y su etiqueta
+	// legible para el texto de contexto. Se usan tanto para armar la línea de atributos
+	// de cada producto como para mapear los filtros que devuelve classify_query().
+	const ATTRIBUTE_LABELS = array(
+		'colores-predominantes' => 'Colores predominantes',
+		'formato'               => 'Formato',
+		'estetica-o-diseno'     => 'Estética/diseño',
+		'terminacion'           => 'Terminación',
+		'acabado'               => 'Acabado',
+		'cantos-o-bordes'       => 'Cantos/bordes',
+		'caras-o-destonalizado' => 'Caras/destonalizado',
+		'm²-por-caja'           => 'm² por caja',
+		'marcas'                => 'Marca',
+	);
+
+	/**
+ * Normaliza un string para comparar términos de taxonomía tolerando mayúsculas,
+ * tildes y espacios extra. Ej: "GRIS OSCURO" == "gris oscuro" == "Gris Oscuro".
+ * Se usa para resolver colores, estética, terminación y cualquier atributo cuyo
+ * nombre exacto en WooCommerce puede diferir de lo que devuelve el clasificador.
+ */
+private static function normalize_term( $value ) {
+	return mb_strtolower( trim( remove_accents( (string) $value ) ), 'UTF-8' );
+}
+
+/**
+ * Busca el term_id real de un término en una taxonomía comparando de forma
+ * normalizada (sin tildes, sin distinción de mayúsculas/minúsculas). Así,
+ * el clasificador puede devolver "gris oscuro" y matchear "GRIS OSCURO".
+ * Si no encuentra nada devuelve null (sin fallback a -1: eso lo decide el caller).
+ */
+private static function get_normalized_term_id( $value, $taxonomy ) {
+	if ( ! taxonomy_exists( $taxonomy ) ) {
+		return null;
+	}
+	$wanted = self::normalize_term( $value );
+	if ( '' === $wanted ) {
+		return null;
+	}
+	$terms = get_terms( array(
+		'taxonomy'   => $taxonomy,
+		'hide_empty' => false,
+		'number'     => 0,
+	) );
+	if ( is_wp_error( $terms ) || empty( $terms ) ) {
+		return null;
+	}
+	// Primero: coincidencia exacta normalizada (ej. "gris oscuro" == "GRIS OSCURO").
+	foreach ( $terms as $term ) {
+		if ( self::normalize_term( $term->name ) === $wanted ) {
+			return (int) $term->term_id;
+		}
+	}
+	// Segundo: coincidencia parcial — el término real CONTIENE lo que pidió el usuario.
+	// Ej. usuario pide "gris claro" y el término es "GRIS CLARO MATE" → igual matchea.
+	foreach ( $terms as $term ) {
+		if ( false !== strpos( self::normalize_term( $term->name ), $wanted ) ) {
+			return (int) $term->term_id;
+		}
+	}
+	// Tercero: lo que pidió el usuario CONTIENE el término real.
+	// Ej. usuario pide "mármol blanco" y el término es "Marmol" → matchea.
+	foreach ( $terms as $term ) {
+		$normalized_name = self::normalize_term( $term->name );
+		if ( mb_strlen( $normalized_name ) >= 4 && false !== strpos( $wanted, $normalized_name ) ) {
+			return (int) $term->term_id;
+		}
+	}
+	return null;
+}
+
+/**
+ * Como get_normalized_term_id pero devuelve TODOS los term_ids que coincidan,
+ * útil para colores: "gris" puede matchear "GRIS", "GRIS OSCURO", "GRIS CLARO".
+ * Cuando el usuario pide "gris" sin calificar, queremos incluir todas las variantes.
+ */
+private static function get_normalized_term_ids_all( $value, $taxonomy ) {
+	if ( ! taxonomy_exists( $taxonomy ) ) {
+		return array();
+	}
+	$wanted = self::normalize_term( $value );
+	if ( '' === $wanted ) {
+		return array();
+	}
+	$terms = get_terms( array(
+		'taxonomy'   => $taxonomy,
+		'hide_empty' => false,
+		'number'     => 0,
+	) );
+	if ( is_wp_error( $terms ) || empty( $terms ) ) {
+		return array();
+	}
+	$ids = array();
+	foreach ( $terms as $term ) {
+		$normalized_name = self::normalize_term( $term->name );
+		// El término real empieza con lo que pidió el usuario (ej. "gris" -> "GRIS", "GRIS OSCURO").
+		if ( 0 === strpos( $normalized_name, $wanted ) ) {
+			$ids[] = (int) $term->term_id;
+			continue;
+		}
+		// Coincidencia exacta completa (ej. "gris oscuro" -> "GRIS OSCURO").
+		if ( $normalized_name === $wanted ) {
+			$ids[] = (int) $term->term_id;
+		}
+	}
+	return $ids;
+}
+
+/**
+ * Normaliza una medida para comparar "60x60", "60 X 60", "60×60 cm", etc.
+ * La salida canónica es siempre "60x60".
+ */
+private static function normalize_format( $value ) {
+    $value = remove_accents( (string) $value );
+    $value = mb_strtolower( trim( $value ), 'UTF-8' );
+    $value = str_replace( array( '×', 'x', 'X' ), 'x', $value );
+    $value = preg_replace( '/\b(cm|cms|centimetros|centímetros)\b/u', '', $value );
+    $value = preg_replace( '/\s+/', '', $value );
+
+    if ( preg_match( '/(\d+(?:[.,]\d+)?)x(\d+(?:[.,]\d+)?)/u', $value, $m ) ) {
+        return str_replace( ',', '.', $m[1] ) . 'x' . str_replace( ',', '.', $m[2] );
+    }
+
+    return $value;
+}
+
+/**
+ * Devuelve el ID del término real de Formato comparando la medida normalizada.
+ * Así no dependemos de que el nombre almacenado sea exactamente "60x60".
+ */
+private static function get_normalized_format_term_ids( $value ) {
+    $taxonomy = taxonomy_exists( 'pa_formato' ) ? 'pa_formato' : 'formato';
+    if ( ! taxonomy_exists( $taxonomy ) ) {
+        return array();
+    }
+
+    $wanted = self::normalize_format( $value );
+    if ( '' === $wanted ) {
+        return array();
+    }
+
+    $terms = get_terms( array(
+        'taxonomy'   => $taxonomy,
+        'hide_empty' => false,
+    ) );
+
+    if ( is_wp_error( $terms ) || empty( $terms ) ) {
+        return array();
+    }
+
+    $ids = array();
+    foreach ( $terms as $term ) {
+        if ( self::normalize_format( $term->name ) === $wanted ) {
+            $ids[] = (int) $term->term_id;
+        }
+    }
+
+    return $ids;
+}
+	
+	/**
+	 * Devuelve la lista de categorías de producto disponibles (slug => nombre),
+	 * usada para que el paso de clasificación elija entre categorías reales.
+	 */
+	public static function get_available_categories() {
+		if ( ! function_exists( 'get_terms' ) ) {
+			return array();
+		}
+
+		$terms = get_terms( array(
+			'taxonomy'   => 'product_cat',
+			'hide_empty' => true,
+		) );
+
+		if ( is_wp_error( $terms ) || empty( $terms ) ) {
+			return array();
+		}
+
+		// Indexar todos los términos por term_id para resolver padres.
+		$by_id = array();
+		foreach ( $terms as $term ) {
+			$by_id[ $term->term_id ] = $term;
+		}
+
+		// Detectar nombres duplicados para saber cuáles necesitan prefijo del padre.
+		$name_count = array();
+		foreach ( $terms as $term ) {
+			$name_count[ $term->name ] = ( $name_count[ $term->name ] ?? 0 ) + 1;
+		}
+
+		$categories = array();
+		foreach ( $terms as $term ) {
+			// Si el nombre es único en todo el catálogo, no necesita prefijo.
+			if ( $name_count[ $term->name ] === 1 || $term->parent === 0 ) {
+				$categories[ $term->slug ] = $term->name;
+			} else {
+				// Nombre duplicado: prefijamos con el nombre del padre para que el
+				// clasificador pueda distinguir "Marmolados y Decorados" de cerámicas
+				// de "Marmolados y Decorados" de porcelanatos.
+				$parent_name = isset( $by_id[ $term->parent ] )
+					? $by_id[ $term->parent ]->name . ' > '
+					: '';
+				$categories[ $term->slug ] = $parent_name . $term->name;
+			}
+		}
+		return $categories;
+	}
+
+	/**
+	 * Ejecuta la búsqueda en WooCommerce y arma el texto de contexto a partir de la categoría/keywords detectados en el mensaje del usuario.
+	 * Búsqueda en cascada: categoría + keywords juntos no encuentran nada (combinación muy específica), reintenta solo con las keywords de la consulta del usuario y si tampoco encuentra nada, reintenta solo con la categoría, antes de no dar respuesta con algun producto.
+	 *
+	 * @param string $category_slug      Slug de categoría (puede venir vacío).
+	 * @param string $keywords           Texto libre de búsqueda (puede venir vacío).
+	 * @param array  $colores            Colores predominantes pedidos (puede venir vacío). Ej: ['blanco'] o ['blanco','gris'].
+	 * @param bool   $single_color_only  true si el usuario pidió explícitamente un producto de un solo color (sin combinar).
+	 * @param array  $atributos          Filtros de atributo adicionales, slug => valor (ej. ['formato' => '60x60', 'terminacion' => 'antideslizante']).
+	 * @param bool   $only_on_sale       true si el usuario pidió ofertas/rebajas/descuentos/remates: solo trae productos en oferta.
+	 * @param bool   $sort_price_asc     true si el usuario pidió lo más económico/barato: ordena de menor a mayor precio (unidad base m² o precio regular) en vez de mezclar por variedad de marca.
+	 * @return array{text:string,products:array} 'text' va al prompt de la IA;
+	 *         'products' es la data (imagen/precio/stock/oferta) para las
+	 *         tarjetas que el widget pinta debajo de la respuesta.
+	 */
+	public static function get_context_for_query( $category_slug, $keywords, $colores = array(), $single_color_only = false, $atributos = array(), $product_type = '', $only_on_sale = false, $sort_price_asc = false ) {
+		if ( ! function_exists( 'wc_get_products' ) ) {
+			Limatco_Chat_Admin::log_error( 'woocommerce', 'lac_wc_inactive', 'wc_get_products() no existe: WooCommerce no está activo' );
+			return array(
+				'text'     => 'WooCommerce no está activo en este sitio.',
+				'products' => array(),
+			);
+		}
+
+		$attr_result     = self::build_attribute_tax_query( $colores, $atributos );
+		$tax_query       = $attr_result['tax_query'];
+		// Atributos no resueltos en taxonomía van a texto libre para no romper el AND.
+		$merged_keywords = trim( $keywords . ' ' . implode( ' ', $attr_result['unresolved_keywords'] ) );
+		// product_type ancla el tipo de producto (porcelanato/cerámica) como keyword
+		// para el paso 4 de la cascada (sin categoría), evitando mezcla de tipos.
+		if ( ! empty( $product_type ) ) {
+			$merged_keywords = trim( $product_type . ' ' . $merged_keywords );
+		}
+
+		// Forzar categoría padre cuando product_type es explícito: si el slug detectado
+		// no pertenece a la familia correcta, buscamos la categoría padre adecuada.
+		$forced_slug = self::resolve_parent_category( $category_slug, $product_type );
+
+		$products = array();
+		if ( ! empty( $tax_query ) ) {
+			$products = self::run_cascade( $forced_slug, $merged_keywords, $tax_query, $only_on_sale, $sort_price_asc );
+
+			if ( $single_color_only && 1 === count( $colores ) ) {
+				$products = self::filter_single_color_only( $products, $colores[0] );
+			}
+
+			// Fallback colores múltiples: reintenta con solo el primer color.
+			if ( empty( $products ) && count( $colores ) > 1 ) {
+				$attr_primary = self::build_attribute_tax_query( array( $colores[0] ), $atributos );
+				$products     = self::run_cascade( $forced_slug, $merged_keywords, $attr_primary['tax_query'], $only_on_sale, $sort_price_asc );
+			}
+		}
+
+		if ( empty( $products ) && empty( $tax_query ) ) {
+			$products = self::run_cascade( $forced_slug, $merged_keywords, array(), $only_on_sale, $sort_price_asc );
+		}
+
+		if ( empty( $products ) ) {
+			return array(
+				'text'     => 'No se encontraron productos que calcen con esa búsqueda en nuestro catálogo, intenta detallando tu búsqueda.',
+				'products' => array(),
+			);
+		}
+
+		$lines          = array();
+		$product_cards = array();
+		foreach ( $products as $product ) {
+			$lines[]         = self::format_product_line( $product );
+			$product_cards[] = self::build_product_card_data( $product );
+		}
+
+		return array(
+			'text'     => implode( "\n", $lines ),
+			'products' => $product_cards,
+		);
+	}
+
+	/**
+	 * Busca por SKU: coincidencia exacta (producto o variación -> padre), y si no, coincidencia parcial.
+	 *
+	 * @return array{text:string,products:array}
+	 */
+	public static function get_context_for_sku( $sku ) {
+		$sku = sanitize_text_field( $sku );
+
+		if ( '' === $sku || ! function_exists( 'wc_get_product_id_by_sku' ) ) {
+			return array(
+				'text'     => 'No se pudo buscar por SKU.',
+				'products' => array(),
+			);
+		}
+
+		$products = array();
+		$id       = wc_get_product_id_by_sku( $sku );
+		if ( $id ) {
+			$product = wc_get_product( $id );
+			if ( $product && $product->is_type( 'variation' ) ) {
+				$product = wc_get_product( $product->get_parent_id() );
+			}
+			if ( $product && 'publish' === $product->get_status() ) {
+				$products[] = $product;
+			}
+		}
+
+		if ( empty( $products ) ) {
+			$products = wc_get_products(
+				array(
+					'status'  => 'publish',
+					'sku'     => $sku,
+					'limit'   => self::MAX_PRODUCTS,
+					'orderby' => 'title',
+					'order'   => 'ASC',
+				)
+			);
+		}
+
+		if ( empty( $products ) ) {
+			return array(
+				'text'     => 'No existe un producto con el SKU/código "' . $sku . '" en el catálogo. Indícalo al usuario y sugiere revisar el código o describir el producto.',
+				'products' => array(),
+			);
+		}
+
+		$lines          = array();
+		$product_cards = array();
+		foreach ( $products as $product ) {
+			$lines[]         = self::format_product_line( $product );
+			$product_cards[] = self::build_product_card_data( $product );
+		}
+
+		return array(
+			'text'     => implode( "\n", $lines ),
+			'products' => $product_cards,
+		);
+	}
+
+	// Palabras que NO identifican un producto por nombre; se descartan al buscar por título.
+	const NAME_GENERIC_WORDS = array(
+		'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una', 'y', 'o', 'para', 'con', 'en', 'por', 'que', 'me', 'te', 'se', 'lo',
+		'producto', 'productos', 'modelo', 'linea', 'coleccion', 'ceramica', 'ceramicas', 'porcelanato', 'porcelanatos',
+		'piso', 'pisos', 'muro', 'muros', 'revestimiento', 'revestimientos', 'ficha', 'fichas', 'tecnica', 'tecnicas',
+		'tienen', 'tiene', 'busco', 'quiero', 'necesito', 'quisiera', 'favor', 'por favor', 'hola', 'precio', 'valor',
+		'info', 'informacion', 'enviar', 'envia', 'enviame', 'mandar', 'manda', 'mandame', 'dame', 'puedes', 'pueden',
+	);
+
+	/**
+	 * Tokens distintivos de un nombre de producto: normalizados, sin palabras genéricas,
+	 * sin medidas (60x60) y sin los valores de $exclude (colores/atributos ya detectados).
+	 */
+	public static function extract_name_tokens( $text, $exclude = array() ) {
+		$text = self::normalize_term( $text );
+		$text = preg_replace( '/\b\d+(?:[.,]\d+)?\s*x\s*\d+(?:[.,]\d+)?\b/u', ' ', $text );
+
+		$exclude_words = array();
+		foreach ( (array) $exclude as $value ) {
+			$parts = preg_split( '/[^a-z0-9]+/', self::normalize_term( $value ), -1, PREG_SPLIT_NO_EMPTY );
+			$exclude_words = array_merge( $exclude_words, $parts );
+		}
+
+		$tokens = array();
+		foreach ( preg_split( '/[^a-z0-9]+/', $text, -1, PREG_SPLIT_NO_EMPTY ) as $word ) {
+			if ( strlen( $word ) < 2 || in_array( $word, self::NAME_GENERIC_WORDS, true ) || in_array( $word, $exclude_words, true ) ) {
+				continue;
+			}
+			$tokens[] = $word;
+		}
+
+		return array_values( array_unique( $tokens ) );
+	}
+
+	/**
+	 * Busca en TODO el catálogo (sin categoría ni atributos) los productos cuyo TÍTULO contiene
+	 * todos los tokens del nombre. 's' (AND de todos los tokens) trae un superconjunto de esos
+	 * títulos; el filtro final por título en PHP descarta los que solo calzan en la descripción.
+	 * Orden: título más corto primero (el más cercano a lo pedido).
+	 *
+	 * @return WC_Product[]
+	 */
+	public static function find_products_by_name( $name, $exclude = array() ) {
+		if ( ! function_exists( 'wc_get_products' ) ) {
+			return array();
+		}
+
+		$tokens = self::extract_name_tokens( $name, $exclude );
+		if ( empty( $tokens ) ) {
+			return array();
+		}
+
+		$pool = wc_get_products(
+			array(
+				'status'  => 'publish',
+				'limit'   => 100,
+				's'       => implode( ' ', $tokens ),
+				'orderby' => 'title',
+				'order'   => 'ASC',
+			)
+		);
+
+		$matches = array();
+		foreach ( $pool as $product ) {
+			$title = self::normalize_term( $product->get_name() );
+			$ok    = true;
+			foreach ( $tokens as $token ) {
+				if ( ! preg_match( '/(?<![a-z0-9])' . preg_quote( $token, '/' ) . 's?(?![a-z0-9])/', $title ) ) {
+					$ok = false;
+					break;
+				}
+			}
+			if ( $ok ) {
+				$matches[] = array( 'product' => $product, 'len' => strlen( $title ) );
+			}
+		}
+
+		usort(
+			$matches,
+			function ( $a, $b ) {
+				return $a['len'] <=> $b['len'];
+			}
+		);
+
+		$products = array_map(
+			function ( $entry ) {
+				return $entry['product'];
+			},
+			$matches
+		);
+
+		return array_slice( $products, 0, self::MAX_PRODUCTS );
+	}
+
+	/**
+	 * Contexto por nombre de producto (misma forma que get_context_for_query()), o null si
+	 * ningún título calza para que el caller siga con la cascada normal.
+	 *
+	 * @return array{text:string,products:array}|null
+	 */
+	public static function get_context_for_name( $name, $exclude = array() ) {
+		$products = self::find_products_by_name( $name, $exclude );
+		if ( empty( $products ) ) {
+			return null;
+		}
+
+		$lines         = array();
+		$product_cards = array();
+		foreach ( $products as $product ) {
+			$lines[]         = self::format_product_line( $product );
+			$product_cards[] = self::build_product_card_data( $product );
+		}
+
+		return array(
+			'text'     => implode( "\n", $lines ),
+			'products' => $product_cards,
+		);
+	}
+
+	/**
+	 * Ficha técnica = campo Descripción del producto (si está vacío, descripción corta), pasado a
+	 * texto plano conservando saltos de línea y viñetas. Se copia tal cual, sin pasar por la IA.
+	 */
+	public static function get_datasheet_text( $product ) {
+		$html = $product->get_description();
+		if ( '' === trim( wp_strip_all_tags( $html ) ) ) {
+			$html = $product->get_short_description();
+		}
+
+		$html = strip_shortcodes( $html );
+		$html = preg_replace( '/<\s*br\s*\/?>|<\/(?:p|div|h[1-6]|tr|ul|ol)>/i', "\n", $html );
+		$html = preg_replace( '/<\s*li[^>]*>/i', "\n- ", $html );
+		$html = preg_replace( '/<\/t[dh]>/i', ' | ', $html );
+
+		$text = html_entity_decode( wp_strip_all_tags( $html ), ENT_QUOTES, 'UTF-8' );
+		$text = preg_replace( '/[ \t]*\|[ \t]*\n/', "\n", $text );
+		$text = preg_replace( '/[ \t]+\n/', "\n", $text );
+		$text = preg_replace( '/\n{3,}/', "\n\n", $text );
+
+		return trim( $text );
+	}
+
+	/**
+	 * Ficha técnica a partir del mensaje del usuario (ej. "ficha técnica de flower blue"):
+	 * busca por nombre en todo el catálogo y toma el mejor calce.
+	 *
+	 * @return array{name:string,url:string,text:string,products:array} 'name' vacío = sin coincidencias.
+	 */
+	public static function get_datasheet_for_query( $message ) {
+		$products = self::find_products_by_name( $message );
+		if ( empty( $products ) ) {
+			return array( 'name' => '', 'url' => '', 'text' => '', 'products' => array() );
+		}
+
+		return self::build_datasheet_result( $products );
+	}
+
+	/**
+	 * Ficha técnica por SKU/código (producto o variación -> padre; si no hay exacto, coincidencia parcial de wc_get_products).
+	 *
+	 * @return array{name:string,url:string,text:string,products:array} 'name' vacío = sin coincidencias.
+	 */
+	public static function get_datasheet_for_sku( $sku ) {
+		$empty = array( 'name' => '', 'url' => '', 'text' => '', 'products' => array() );
+		$sku   = sanitize_text_field( $sku );
+
+		if ( '' === $sku || ! function_exists( 'wc_get_product_id_by_sku' ) ) {
+			return $empty;
+		}
+
+		$products = array();
+		$id       = wc_get_product_id_by_sku( $sku );
+		if ( $id ) {
+			$product = wc_get_product( $id );
+			if ( $product && $product->is_type( 'variation' ) ) {
+				$product = wc_get_product( $product->get_parent_id() );
+			}
+			if ( $product && 'publish' === $product->get_status() ) {
+				$products[] = $product;
+			}
+		}
+
+		if ( empty( $products ) ) {
+			$products = wc_get_products(
+				array(
+					'status'  => 'publish',
+					'sku'     => $sku,
+					'limit'   => self::MAX_PRODUCTS,
+					'orderby' => 'title',
+					'order'   => 'ASC',
+				)
+			);
+		}
+
+		return empty( $products ) ? $empty : self::build_datasheet_result( $products );
+	}
+
+	/** Arma el resultado de ficha técnica (nombre, url, texto y tarjetas) tomando el primer producto como principal. */
+	private static function build_datasheet_result( $products ) {
+		$main  = $products[0];
+		$cards = array();
+		foreach ( $products as $product ) {
+			$cards[] = self::build_product_card_data( $product );
+		}
+
+		return array(
+			'name'     => $main->get_name(),
+			'url'      => get_permalink( $main->get_id() ),
+			'text'     => self::get_datasheet_text( $main ),
+			'products' => $cards,
+		);
+	}
+
+	/**
+	 * Cascada categoría+keywords -> solo keywords -> solo categoría, aplicando el mismo
+	 * $tax_query (opcional) en los 3 pasos. Es la misma cascada de siempre, solo separada
+	 * en su propio método para poder correrla dos veces (con y sin atributos) desde
+	 * get_context_for_query().
+	 */
+	/**
+	 * Si el usuario pidió explícitamente cerámica o porcelanato, garantiza que el
+	 * $category_slug pertenezca a esa familia padre. Si no pertenece (el clasificador
+	 * eligió una subcategoría del tipo equivocado), devuelve el slug padre correcto.
+	 * Las familias raíz son fijas: ceramicas-piso, ceramicas-para-muros, porcelanatos-esmaltados.
+	 */
+	private static function resolve_parent_category( $category_slug, $product_type ) {
+		if ( empty( $product_type ) || empty( $category_slug ) ) {
+			return $category_slug;
+		}
+
+		$pt = mb_strtolower( remove_accents( $product_type ), 'UTF-8' );
+
+		// Familias raíz por tipo de producto.
+		$roots = array(
+			'ceramica'    => array( 'ceramicas-piso', 'ceramicas-para-muros' ),
+			'ceramicas'   => array( 'ceramicas-piso', 'ceramicas-para-muros' ),
+			'porcelanato' => array( 'porcelanatos-esmaltados' ),
+			'porcelanatos'=> array( 'porcelanatos-esmaltados' ),
+		);
+
+		$allowed_roots = null;
+		foreach ( $roots as $key => $families ) {
+			if ( false !== strpos( $pt, $key ) ) {
+				$allowed_roots = $families;
+				break;
+			}
+		}
+
+		if ( null === $allowed_roots ) {
+			return $category_slug; // tipo desconocido, no forzar
+		}
+
+		// Verificar que el slug actual sea descendiente de alguna familia permitida.
+		$term = get_term_by( 'slug', $category_slug, 'product_cat' );
+		if ( ! $term || is_wp_error( $term ) ) {
+			return $category_slug;
+		}
+
+		$ancestors = get_ancestors( $term->term_id, 'product_cat', 'taxonomy' );
+		// Incluir el propio término en la comprobación (puede ser él mismo la raíz).
+		$ancestor_slugs = array( $category_slug );
+		foreach ( $ancestors as $ancestor_id ) {
+			$ancestor = get_term( $ancestor_id, 'product_cat' );
+			if ( $ancestor && ! is_wp_error( $ancestor ) ) {
+				$ancestor_slugs[] = $ancestor->slug;
+			}
+		}
+
+		foreach ( $allowed_roots as $root ) {
+			if ( in_array( $root, $ancestor_slugs, true ) ) {
+				return $category_slug; // ya pertenece a la familia correcta
+			}
+		}
+
+		// No pertenece: usar el primer root permitido como categoría forzada.
+		// La cascada buscará dentro de esa familia con los atributos.
+		return $allowed_roots[0];
+	}
+
+	private static function run_cascade( $category_slug, $keywords, $tax_query, $only_on_sale = false, $sort_price_asc = false ) {
+		// Paso 1: categoría + keywords + atributos.
+		$products = self::search_products( $category_slug, $keywords, $tax_query, $only_on_sale, $sort_price_asc );
+
+		// Paso 2: sin categoría + keywords + atributos.
+		if ( empty( $products ) && ! empty( $category_slug ) && ! empty( $keywords ) ) {
+			$products = self::search_products( '', $keywords, $tax_query, $only_on_sale, $sort_price_asc );
+		}
+
+		// Paso 3: categoría + atributos (sin keywords).
+		if ( empty( $products ) && ! empty( $category_slug ) ) {
+			$products = self::search_products( $category_slug, '', $tax_query, $only_on_sale, $sort_price_asc );
+		}
+
+		// Paso 4: solo atributos, sin categoría ni keywords.
+		// Cubre el caso donde categoría es incorrecta y keywords está vacío.
+		if ( empty( $products ) && ! empty( $category_slug ) && ! empty( $tax_query ) ) {
+			$products = self::search_products( '', '', $tax_query, $only_on_sale, $sort_price_asc );
+		}
+
+		return $products;
+	}
+
+	/**
+	 * Busca en WooCommerce con la categoría/keywords dados
+	 * Las keywords se parten en términos individuales y se buscan en OR (no como frase completa en AND): 
+	 * WordPress exige que TODAS las palabras de '?s' aparezcan para que un producto califique, así que una frase
+	 * de 2-3 palabras (ej. "interior alto tránsito") casi nunca calza completa aunque
+	 * el producto sí cumpla con cada término por separado. Se prioriza a los productos
+	 * que calzan con más términos, y se mezcla el resto para variar marcas.
+	 */
+	private static function search_products( $category_slug, $keywords, $tax_query = array(), $only_on_sale = false, $sort_price_asc = false ) {
+		$keywords = trim( (string) $keywords );
+
+		if ( '' === $keywords ) {
+			$products = self::run_single_term_query( $category_slug, '', $tax_query, $only_on_sale );
+			error_log( 'LIMATCO DEBUG - WC RESULTS (keywords vacías): ' . count( $products ) );
+			if ( empty( $products ) ) {
+				return $products;
+			}
+			if ( $sort_price_asc ) {
+				return self::sort_by_price_asc( $products );
+			}
+			// Mismo tratamiento que el resto: mezclar (variedad de marca) y recortar
+			// a MAX_PRODUCTS. Sin esto, una categoría/keywords vacías devolvía hasta
+			// SHUFFLE_POOL_SIZE productos sin filtrar (ej. el bug de "hola" -> 30+ productos).
+			shuffle( $products );
+			return array_slice( $products, 0, self::MAX_PRODUCTS );
+		}
+
+		$terms = self::expand_search_terms( $keywords );
+
+		if ( empty( $terms ) ) {
+			$products = self::run_single_term_query( $category_slug, $keywords, $tax_query, $only_on_sale );
+			return $sort_price_asc ? self::sort_by_price_asc( $products ) : $products;
+		}
+
+		$scored = array(); // id => array('product' => WC_Product, 'score' => int)
+
+		foreach ( $terms as $term ) {
+			$found = self::run_single_term_query( $category_slug, $term, $tax_query, $only_on_sale );
+			error_log( 'LIMATCO DEBUG - WC RESULTS (término "' . $term . '"): ' . count( $found ) );
+			foreach ( $found as $product ) {
+				$id = $product->get_id();
+				if ( ! isset( $scored[ $id ] ) ) {
+					$scored[ $id ] = array(
+						'product' => $product,
+						'score'   => 0,
+					);
+				}
+				$scored[ $id ]['score']++;
+			}
+		}
+
+		if ( empty( $scored ) ) {
+			return array();
+		}
+
+		$entries = array_values( $scored );
+
+		// Pedido de "más barato/económico": el orden lo decide el precio, no la
+		// variedad de marca ni el score de coincidencia de keywords.
+		if ( $sort_price_asc ) {
+			$products = array_map(
+				function ( $entry ) {
+					return $entry['product'];
+				},
+				$entries
+			);
+			return self::sort_by_price_asc( $products );
+		}
+
+		// Se mezcla ANTES de ordenar por score para que los empates queden en orden
+		// aleatorio (variedad de marca) en vez de siempre en el mismo orden.
+		shuffle( $entries );
+		error_log( 'LIMATCO DEBUG - AFTER SHUFFLE (top 10): ' . wp_json_encode( array_slice( $entries, 0, 10 ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+		usort(
+			$entries,
+			function ( $a, $b ) {
+				return $b['score'] <=> $a['score'];
+			}
+		);
+
+		$products = array_map(
+			function ( $entry ) {
+				return $entry['product'];
+			},
+			$entries
+		);
+
+		return array_slice( $products, 0, self::MAX_PRODUCTS );
+	}
+
+	/**
+	 * Ordena productos de menor a mayor precio y recorta a MAX_PRODUCTS. El precio
+	 * comparado es el "precio unidad base" (m²) para productos M2 (ver get_m2_unit_price,
+	 * precio fijo sin importar oferta) o el precio regular (get_price()) para el resto.
+	 * Usado por "más económico/barato" y "X más barato".
+	 */
+	private static function sort_by_price_asc( $products ) {
+		usort(
+			$products,
+			function ( $a, $b ) {
+				return self::get_comparable_price( $a ) <=> self::get_comparable_price( $b );
+			}
+		);
+		return array_slice( $products, 0, self::MAX_PRODUCTS );
+	}
+
+	/** Precio usado para comparar/ordenar por "más barato": unidad base m² si aplica, si no el precio regular del producto. */
+	private static function get_comparable_price( $product ) {
+		$m2_unit = self::get_m2_unit_price( $product );
+		return null !== $m2_unit ? $m2_unit : (float) $product->get_price();
+	}
+
+	/**
+	 * Parte "interior alto tránsito" en ["interior", "alto", "tránsito"] y agrega,
+	 * para cada palabra que termine en "s" (plural simple en español), la versión
+	 * sin esa "s" como término adicional — así "cerámicas" (lo que suele escribir el
+	 * usuario) también encuentra productos nombrados en singular ("Cerámica ...").
+	 */
+	private static function expand_search_terms( $keywords ) {
+		$words = preg_split( '/\s+/', $keywords );
+		$words = array_filter(
+			$words,
+			function ( $word ) {
+				return mb_strlen( $word ) >= 2;
+			}
+		);
+
+		$terms = array();
+		foreach ( $words as $word ) {
+			$terms[] = $word;
+			if ( mb_strtolower( mb_substr( $word, -1 ) ) === 's' && mb_strlen( $word ) > 3 ) {
+				$terms[] = mb_substr( $word, 0, -1 );
+			}
+		}
+
+		return array_values( array_unique( $terms ) );
+	}
+
+	/** Ejecuta una única consulta a WooCommerce con la categoría/término dados (cualquiera de los dos puede venir vacío), más un $tax_query opcional (filtro de atributos: color/formato/terminación/etc.) y $only_on_sale (solo productos en oferta). */
+	private static function run_single_term_query( $category_slug, $term, $tax_query = array(), $only_on_sale = false ) {
+		$args = array(
+			'status'  => 'publish',
+			'limit'   => self::SHUFFLE_POOL_SIZE,
+			// 'orderby' => 'rand' aquí (no solo shuffle() después) es lo que de verdad varía
+			// qué productos entran al pool: sin esto, WooCommerce siempre trae el mismo
+			// top-N por fecha para un mismo término, y el shuffle() posterior solo mezcla
+			// el ORDEN de ese mismo grupo fijo — por eso seguían saliendo los mismos productos.
+			// Con ~300 productos en el catálogo, el costo de ORDER BY RAND() es despreciable;
+			// si el catálogo crece a varios miles, esto habría que revisitarlo.
+			'orderby' => 'rand',
+		);
+
+		if ( ! empty( $category_slug ) ) {
+			$args['category'] = array( $category_slug );
+		}
+
+		if ( ! empty( $term ) ) {
+			$args['s'] = $term;
+		}
+
+		if ( ! empty( $tax_query ) ) {
+			// wc_get_products() reenvía argumentos no reconocidos directamente a WP_Query,
+			// así que 'tax_query' filtra por los Atributos del producto (color/formato/etc.)
+			// igual que si se filtrara por categoría.
+			error_log(
+    			'LIMATCO DEBUG - TAX_QUERY: ' .
+				wp_json_encode( $tax_query, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES )
+			);
+			$args['tax_query'] = $tax_query;
+		}
+
+		// Ofertas/rebajas/descuentos/remate: restringe el pool a los IDs actualmente
+		// en oferta antes de aplicar categoría/keywords/atributos.
+		if ( $only_on_sale ) {
+			$sale_ids = wc_get_product_ids_on_sale();
+			if ( empty( $sale_ids ) ) {
+				return array();
+			}
+			$args['include'] = $sale_ids;
+		}
+
+		// Toggle admin "no mostrar productos con stock menor a 20": excluye productos
+		// con stock gestionado y cantidad < LOW_STOCK_THRESHOLD; los que no gestionan
+		// stock (meta '_stock' inexistente) no se ven afectados por este filtro.
+		if ( self::exclude_low_stock_enabled() ) {
+			$args['meta_query'] = array(
+				'relation' => 'OR',
+				array(
+					'key'     => 'stock',
+					'value'   => self::LOW_STOCK_THRESHOLD,
+					'compare' => '>=',
+					'type'    => 'NUMERIC',
+				),
+				array(
+					'key'     => 'stock',
+					'compare' => 'NOT EXISTS',
+				),
+			);
+		}
+
+		error_log( 'LIMATCO DEBUG - WC_ARGS: ' . wp_json_encode( $args, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+
+		return wc_get_products( $args );
+	}
+
+	/**
+	 * Info de precio m² para un producto "unidad_stock = M2", o null si no aplica
+	 * (producto C/U, o falta/no es numérico "_precio_unidad_base").
+	 *
+	 * "regular" es siempre el precio base fijo (_precio_unidad_base, valor crudo).
+	 * Si la caja esta en oferta (is_on_sale()), "price" se recalcula como
+	 * precio_oferta_caja / rendimiento_m2_por_caja (meta con coma decimal, ej.
+	 * "2,17" -> 2.17) y "on_sale" queda true; si no hay oferta, o si el
+	 * rendimiento no es un numero valido, "price"
+	 * cae de vuelta al precio base y "on_sale" queda false.
+	 */
+	public static function get_m2_price_info( $product ) {
+		$unidad = get_post_meta( $product->get_id(), "unidad_stock", true );
+		if ( "M2" !== $unidad ) {
+		return null;
+		}
+		$base = get_post_meta( $product->get_id(), "precio_unidad_base", true );
+		if ( "" === $base || ! is_numeric( $base ) ) {
+			return null;
+		}
+		$regular_m2 = (float) $base;
+		$price_m2 = $regular_m2;
+		$on_sale = false;
+		$discount_percent = 0;
+		if ( $product->is_on_sale() ) {
+			$rendimiento_raw = get_post_meta( $product->get_id(), "rendimiento_m2_por_caja", true );
+			$rendimiento = (float) str_replace( ",", ".", (string) $rendimiento_raw );
+			if ( $rendimiento > 0 ) {
+				$sale_box_price = (float) $product->get_price();
+				$price_m2 = $sale_box_price / $rendimiento;
+				$on_sale = true;
+				if ( $regular_m2 > 0 ) {
+					$discount_percent = (int) round( ( ( $regular_m2 - $price_m2 ) / $regular_m2 ) * 100 );
+				}
+			}
+		}
+		return array(
+			"regular" => $regular_m2,
+			"price" => $price_m2,
+			"on_sale" => $on_sale,
+			"discount_percent" => $discount_percent,
+		);
+	}
+
+	public static function get_m2_unit_price( $product ) {
+		$unidad = get_post_meta( $product->get_id(), 'unidad_stock', true );
+		if ( 'M2' !== $unidad ) {
+			return null;
+		}
+
+		$base = get_post_meta( $product->get_id(), 'precio_unidad_base', true );
+		if ( '' === $base || ! is_numeric( $base ) ) {
+			return null;
+		}
+
+		return (float) $base;
+	}
+
+	/**
+	 * Formatea un producto de WooCommerce como una línea de contexto.
+	 * Usa los Atributos del catálogo (colores, formato, terminación, etc. — ver
+	 * ATTRIBUTE_LABELS) en vez de la descripción larga: son datos estructurados,
+	 * mucho más confiables para que la IA filtre por color/formato/antideslizante
+	 * que tener que interpretar un párrafo de texto libre.
+	 */
+	private static function format_product_line( $product ) {
+		$name     = $product->get_name();
+		$m2_info  = self::get_m2_price_info( $product );
+		$price    = html_entity_decode( wp_strip_all_tags( wc_price( null !== $m2_info ? $m2_info['price'] : $product->get_price() ) ), ENT_QUOTES, 'UTF-8' );
+		if ( null !== $m2_info ) {
+			$price .= ' m²';
+			if ( $m2_info['on_sale'] ) {
+				$price .= ' (en oferta, precio normal ' . html_entity_decode( wp_strip_all_tags( wc_price( $m2_info['regular'] ) ), ENT_QUOTES, 'UTF-8' ) . ' m²)';
+			}
+		}
+		$stock       = $product->is_in_stock() ? 'Disponible' : 'Sin stock';
+		$sku         = $product->get_sku();
+		$url         = get_permalink( $product->get_id() );
+
+		$parts = array(
+			'- ' . $name,
+			'Precio: ' . $price,
+			$stock,
+		);
+
+		if ( ! empty( $sku ) ) {
+			$parts[] = 'SKU: ' . $sku;
+		}
+
+		$attributes_text = self::format_attributes( $product );
+		if ( ! empty( $attributes_text ) ) {
+			$parts[] = $attributes_text;
+		}
+
+		$parts[] = 'Link: ' . $url;
+
+		return implode( ' | ', $parts );
+	}
+
+	/** Arma la línea "Colores predominantes: X | Formato: Y | ..." con los atributos que el producto sí tenga cargados (~1773/1993 en el catálogo actual). */
+	private static function format_attributes( $product ) {
+		$lines = array();
+		foreach ( self::ATTRIBUTE_LABELS as $slug => $label ) {
+			$values = self::get_attribute_terms( $product, $slug );
+			if ( ! empty( $values ) ) {
+				$lines[] = $label . ': ' . implode( ', ', $values );
+			}
+		}
+		return implode( ' | ', $lines );
+	}
+
+	/**
+	 * Lee los valores (nombres de término) de un Atributo del producto dado su slug.
+	 * Se prueba primero con el prefijo 'pa_' (así registra internamente WooCommerce
+	 * los atributos globales) y, si esa taxonomía no existe, se prueba el slug tal
+	 * cual — mismo patrón de fallback que get_product_brand() más abajo.
+	 */
+	private static function get_attribute_terms( $product, $slug ) {
+		$taxonomies = array( 'pa_' . $slug, $slug );
+
+		foreach ( $taxonomies as $taxonomy ) {
+			if ( ! taxonomy_exists( $taxonomy ) ) {
+				continue;
+			}
+			$terms = get_the_terms( $product->get_id(), $taxonomy );
+			if ( ! is_wp_error( $terms ) && ! empty( $terms ) ) {
+				return wp_list_pluck( $terms, 'name' );
+			}
+		}
+
+		return array();
+	}
+
+	/**
+	 * Arma el tax_query de WP_Query a partir de los colores/atributos que
+	 * Limatco_Chat_Api::classify_query() ya extrajo del mensaje del usuario.
+	 *
+	 * Los colores usan 'AND' cuando el usuario pidió una combinación de 2+ colores
+	 * específica (el producto debe tenerlos TODOS) y 'IN' cuando pidió solo 1 color
+	 * (basta con que lo tenga, aunque el producto tenga otros colores además).
+	 *
+	 * @param array $colores   Ej: ['blanco'] o ['blanco', 'gris'].
+	 * @param array $atributos Filtros adicionales, slug => valor. Ej: ['formato' => '60x60'].
+	 */
+	private static function build_attribute_tax_query( $colores, $atributos ) {
+		$clauses             = array();
+		$unresolved_keywords = array(); // no matchearon en taxonomía -> van a texto libre
+
+		if ( ! empty( $colores ) ) {
+			$color_taxonomy = taxonomy_exists( 'pa_colores-predominantes' ) ? 'pa_colores-predominantes' : 'colores-predominantes';
+			if ( taxonomy_exists( $color_taxonomy ) ) {
+				if ( count( $colores ) === 1 ) {
+					$color_ids = self::get_normalized_term_ids_all( $colores[0], $color_taxonomy );
+					if ( ! empty( $color_ids ) ) {
+						$clauses[] = array(
+							'taxonomy' => $color_taxonomy,
+							'field'    => 'term_id',
+							'terms'    => $color_ids,
+							'operator' => 'IN',
+						);
+					} else {
+						$unresolved_keywords[] = $colores[0];
+					}
+				} else {
+					// Múltiples colores: AND por cada uno. Los que no existen van a keywords.
+					foreach ( $colores as $color ) {
+						$color_id = self::get_normalized_term_id( $color, $color_taxonomy );
+						if ( null !== $color_id ) {
+							$clauses[] = array(
+								'taxonomy' => $color_taxonomy,
+								'field'    => 'term_id',
+								'terms'    => array( $color_id ),
+								'operator' => 'IN',
+							);
+						} else {
+							$unresolved_keywords[] = $color;
+						}
+					}
+				}
+			}
+		}
+
+		foreach ( $atributos as $slug => $value ) {
+			if ( '' === $value ) {
+				continue;
+			}
+			$taxonomy = taxonomy_exists( 'pa_' . $slug ) ? 'pa_' . $slug : $slug;
+			if ( ! taxonomy_exists( $taxonomy ) ) {
+				$unresolved_keywords[] = $value;
+				continue;
+			}
+			if ( 'formato' === $slug ) {
+				$term_ids = self::get_normalized_format_term_ids( $value );
+				if ( ! empty( $term_ids ) ) {
+					$clauses[] = array(
+						'taxonomy' => $taxonomy,
+						'field'    => 'term_id',
+						'terms'    => $term_ids,
+						'operator' => 'IN',
+					);
+				} else {
+					$unresolved_keywords[] = $value;
+				}
+				continue;
+			}
+			$term_id = self::get_normalized_term_id( $value, $taxonomy );
+			if ( null !== $term_id ) {
+				$clauses[] = array(
+					'taxonomy' => $taxonomy,
+					'field'    => 'term_id',
+					'terms'    => array( $term_id ),
+					'operator' => 'IN',
+				);
+			} else {
+				$unresolved_keywords[] = $value;
+			}
+		}
+
+		$tax_query = array();
+		if ( ! empty( $clauses ) ) {
+			$clauses['relation'] = 'AND';
+			$tax_query           = $clauses;
+		}
+		return array(
+			'tax_query'           => $tax_query,
+			'unresolved_keywords' => $unresolved_keywords,
+		);
+	}
+
+	/**
+	 * Para cuando el usuario pide explícitamente un producto de UN SOLO color (ej.
+	 * "que sea puro blanco, sin combinar"). El tax_query con 'IN' ya asegura que el
+	 * producto TIENE ese color, pero no que sea el ÚNICO; WP_Query no puede expresar
+	 * "cantidad de términos = 1", así que se filtra en PHP después de la consulta.
+	 */
+	private static function filter_single_color_only( $products, $color ) {
+		return array_values(
+			array_filter(
+				$products,
+				function ( $product ) {
+					return 1 === count( self::get_attribute_terms( $product, 'colores-predominantes' ) );
+				}
+			)
+		);
+	}
+
+	/**
+	 * Arma la data (imagen, precio, stock, oferta) que el widget usa para
+	 * pintar la tarjeta visual de cada producto debajo de la respuesta.
+	 */
+	private static function build_product_card_data( $product ) {
+		$image_id  = $product->get_image_id();
+		$image_url = $image_id
+			? wp_get_attachment_image_url( $image_id, 'medium' )
+			: wc_placeholder_img_src( 'medium' );
+
+		// Producto por m²: al estar en oferta, se calcula el valor con rendimiento_m2_por_caja (ver get_m2_price_info)
+		// Si no hay oferta o no se puede calcular, es solo el precio base en m².
+		$m2_info = self::get_m2_price_info( $product );
+
+
+		$on_sale          = ( null !== $m2_info ) ? $m2_info['on_sale'] : $product->is_on_sale();
+		$discount_percent = ( null !== $m2_info ) ? $m2_info['discount_percent'] : 0;
+
+		if ( null === $m2_info && $on_sale ) {
+			$regular = (float) $product->get_regular_price();
+			$current = (float) $product->get_price();
+			if ( $regular > 0 ) {
+				$discount_percent = (int) round( ( ( $regular - $current ) / $regular ) * 100 );
+			}
+		}
+
+		$price_amount   = null !== $m2_info ? $m2_info['price'] : $product->get_price();
+		$price_text     = html_entity_decode( wp_strip_all_tags( wc_price( $price_amount ) ), ENT_QUOTES, 'UTF-8' );
+		$regular_amount = null !== $m2_info ? $m2_info['regular'] : ( float ) $product->get_regular_price();
+		if ( null !== $m2_info ) {
+			$price_text .= ' m²';
+		}
+
+
+		return array(
+			'id'                => $product->get_id(),
+			'name'              => $product->get_name(),
+			'brand'             => self::get_product_brand( $product ),
+			'sku'               => $product->get_sku(),
+			'image'             => $image_url,
+			'url'               => get_permalink( $product->get_id() ),
+			// wc_price() devuelve el símbolo de moneda como entidad HTML (&#36;);
+			// hay que decodificarla además de quitar las etiquetas, o queda "&#36;24.225" en pantalla.
+			'price'             => $price_text,
+			'regular_price'     => $on_sale ? ( html_entity_decode( wp_strip_all_tags( wc_price( $regular_amount ) ), ENT_QUOTES, 'UTF-8' ) . ( null !== $m2_info ? ' m²' : '' ) ) : '',
+			'on_sale'           => $on_sale,
+			'discount_percent'  => $discount_percent,
+			'in_stock'          => $product->is_in_stock(),
+			'stock_text'        => $product->is_in_stock() ? 'Disponible' : 'Sin stock',
+		);
+	}
+
+	/**
+	 * Lee la marca desde la taxonomía de marca de WooCommerce (la "casilla de Marca"
+	 * del producto), no desde la descripción. Se prueban varios slugs de taxonomía
+	 * porque varía según cómo esté configurado el sitio:
+	 * 'product_brand' es el feature nativo de WooCommerce (desde WC 8.3); 'pwb-brand'
+	 * y 'yith_product_brand' son de plugins de marca comunes. Si en tu sitio la marca
+	 * no aparece en la tarjeta, revisa en wp-admin → Productos → Marcas cuál es el slug
+	 * real (aparece en la URL de esa pantalla) y avísame para ajustarlo.
+	 */
+	private static function get_product_brand( $product ) {
+		$brand_taxonomies = array( 'product_brand', 'pwb-brand', 'yith_product_brand' );
+
+		foreach ( $brand_taxonomies as $taxonomy ) {
+			if ( ! taxonomy_exists( $taxonomy ) ) {
+				continue;
+			}
+			$terms = get_the_terms( $product->get_id(), $taxonomy );
+			if ( ! is_wp_error( $terms ) && ! empty( $terms ) ) {
+				return $terms[0]->name;
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Busca un término en una taxonomía con matching normalizado (tolera tildes y
+	 * mayúsculas) y devuelve el objeto WP_Term para poder obtener su get_term_link().
+	 * Usado por handle_message para construir los search_links de la tarjeta final.
+	 */
+	public static function get_public_term( $value, $taxonomy ) {
+		$wanted = self::normalize_term( $value );
+		$terms  = get_terms( array(
+			'taxonomy'   => $taxonomy,
+			'hide_empty' => false,
+			'number'     => 0,
+		) );
+		if ( is_wp_error( $terms ) || empty( $terms ) ) {
+			return null;
+		}
+		// Coincidencia exacta normalizada primero.
+		foreach ( $terms as $term ) {
+			if ( self::normalize_term( $term->name ) === $wanted ) {
+				return $term;
+			}
+		}
+		// Coincidencia parcial: término real contiene el valor buscado.
+		foreach ( $terms as $term ) {
+			if ( false !== strpos( self::normalize_term( $term->name ), $wanted ) ) {
+				return $term;
+			}
+		}
+		return null;
+	}
+}

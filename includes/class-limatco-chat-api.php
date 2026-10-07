@@ -1,0 +1,1034 @@
+<?php
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/** Endpoint REST: classify_query() detecta categoría/keywords, Limatco_Chat_Context busca en WooCommerce, y call_gemini_api() responde usando solo esos productos como contexto. */
+class Limatco_Chat_Api {
+
+	const NAMESPACE_ROUTE = 'limatco-chat/v1';
+	// Endpoint Gemini compatible con OpenAI: mismo formato de "messages" y respuesta en choices[0].message.content.
+	const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+
+	// Instrucciones de formato para la respuesta final (no para la clasificación). Se agregan al prompt de sistema junto con el contexto de productos.
+	const RESPONSE_FORMAT_INSTRUCTIONS = "IMPORTANTE — esta regla de formato tiene prioridad sobre cualquier instrucción de listar/enlazar/agrupar productos que pueda venir en el prompt de sistema de arriba: cuando el contexto de abajo SÍ incluya productos encontrados, NO los listes ni los enumeres en tu respuesta (nada de viñetas, encabezados por marca, ni nombre/link/precio de cada uno): esos datos ya se muestran automáticamente como tarjetas visuales con imagen, precio y stock justo debajo de tu mensaje, así que repetirlos en texto es redundante. En ese caso responde en 1-3 frases, en prosa natural: resume brevemente qué encontraste (material, estilo, cuántas opciones) y, si corresponde, guía al usuario con una pregunta de seguimiento sobre su necesidad. Usa Markdown solo para énfasis simple (negrita), nunca para listas de productos ni links a productos. Si el contexto indica que NO se encontraron productos, explica eso con naturalidad y ofrece ayudar a acotar la búsqueda.";
+
+	// Respuesta fija cuando el usuario quiere contactar a un ejecutivo/central de cotizaciones.
+	const PHONE_REPLY = "Si deseas recibir ayuda con un ejecutivo, llama a este número, directo a nuestra central de cotizaciones: +56 2 2938 1410 [Haz clic para llamar a Central de Cotizaciones](tel:229381410)";
+
+	// Glosario de términos técnicos del catálogo (PEI, rectificado, m², antideslizante, etc.).
+	// Se agrega al prompt SOLO cuando hay productos en el contexto (ver handle_message):
+	// así una consulta sin resultados (saludo, sucursales, etc.) no paga estos tokens.
+	// TEXTO DE EJEMPLO — reemplázalo con la redacción real que quieras usar.
+	const TECHNICAL_TERMS_CONTEXT = "PEI: escala de resistencia a la abrasión superficial (PEI 1 a PEI 5); a mayor número, más apto para tránsito alto/comercial.\n"
+. "## Porcelanato"
+. "**Formato >45x45 cm:** recomendar adhesivo de mayor desempeño (ej. D.A.), según ficha técnica."
+. "**Interior/Exterior:** verificar ubicación y resistencia requerida."
+. "**Alto tránsito:** verificar PEI; evitar superficies brillantes susceptibles al rayado."
+. "**Cocina/quincho:** considerar resistencia a manchas; precaución con porcelanato técnico pulido."
+. "**Carga pesada:** estacionamientos/bodegas → verificar resistencia mecánica y uso vehicular."
+. "**Muro:** verificar sustrato (tabiquería/hormigón) y capacidad de carga; formatos grandes pueden ejercer alta carga."
+. "**Sustrato flexible:** porcelanato/gres requieren base rígida; evitar instalación sobre estructuras con flexión."
+. "**Nivelación:** el adhesivo no reemplaza la nivelación; respetar espesor máximo recomendado (referencia: 5–6 mm)."
+. "## Cerámica de muro"
+. "**Exterior:** verificar absorción de agua; ciertas fachaletas requieren ≤6%."
+. "**Sustrato:** identificar hormigón, albañilería o tabiquería antes de definir preparación/adhesivo."
+. "**Uso:** cerámica exclusivamente de muro → NO recomendar para pisos."
+. "**Piso en muro:** verificar capacidad estructural por mayor peso."
+. "**Adhesivo:** preferir adhesivo en pasta cuando sea compatible."
+. "**Secado:** con adhesivo en pasta, respetar al menos 48 h antes de fraguar, salvo indicación distinta del fabricante."
+. "**Adhesivos:** no mezclar estándar, D.A. y pasta."
+. "## Cerámica de piso"
+. "**Estacionamientos:** verificar uso vehicular; considerar productos con granilla específica para estacionamientos/antideslizante."
+. "**PEI:** seleccionar según tránsito y recinto. Referencia: PEI 3 para uso residencial moderado; PEI 4 para mayor tránsito/comercio liviano."
+. "**Recinto:** identificar uso (dormitorio, living, cocina, acceso, comercio, etc.) antes de recomendar PEI."
+. "**Terraza:** verificar si es techada o descubierta; exterior expuesto a humedad → preferir superficie texturada/granillada antideslizante."
+. "**Tono/Calibre:** procurar comprar toda la partida junta y verificar mismo tono/calibre antes de instalar."
+. "**Destonalizado:** confirmar si el cliente busca color uniforme o variación entre caras; mostrar/considerar imágenes instaladas cuando estén disponibles.";
+	
+
+	// Contexto de sucursales (dirección, teléfonos, horarios). Se inyecta en el prompt
+	// is_branches_query()); IA responde de forma natural y específica a lo que se le pregunte
+	const BRANCHES_CONTEXT = "[Sucursal Independencia](https://limatco.cl/sucursal-independencia/) ubicada en: Coronel Agustín López de Alcázar 546, Independencia\nSala de Ventas\n+56 2 2637 5566\n+56 2 2637 5500\n+56 2 2716 4650\n+56 5 7276 9342\nSucursal de Central Cotizaciones\n+56 2 2938 1410\n[Llamar a Central de Cotizaciones](tel:56229381410)\nHorario de Atención\nLunes a Viernes 9:00 - 19:00 Hrs\nSábado 9:00 - 14:00 Hrs.\n\n[Sucursal Vespucio Sur](https://limatco.cl/sucursal-vespucio-sur/) ubicada en: Av. Américo Vespucio 4288\nVentas\n+56 2 2221 1030\n+56 2 2221 1656\nAtención a clientes\n+56 2 2221 2477\n+56 2 2711 7603\n+56 6 5275 8446\nHorario de Atención\nLunes a Viernes 09:00 - 19:00 Hrs.\nSábado 09:00 - 14:00 Hrs.\n\n[Sucursal Manquehue sur](https://limatco.cl/sucursal-manquehue-sur/) ubicada en: Manquehue Sur 676\nVentas\n+56 2 2342 2481\n+56 2 2298 5739\n+56 9 6407 2969\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal San Miguel](https://limatco.cl/sucursal-san-miguel/) ubicada en: Gran Avenida 4559\nVentas\n+56 2 2324 5681\n+56 9 6520 2999\n+56 9 5333 4007\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Puente Alto](https://limatco.cl/sucursal-puente-alto/) ubicada en: Eyzaguirre 077, esquina Balmaceda\nVentas\n+56 2 2493 1506\n+56 9 8527 5859\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Maipú](https://limatco.cl/sucursal-maipu/) ubicada en: Libertador Gral. Bernardo O'Higgins 10 (esquina Pajaritos)\nVentas\n+56 2 2458 0935\n+56 2 2418 0613\n+56 9 7430 0982\n+56 9 6495 4936\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal San Bernardo](https://limatco.cl/sucursal-san-bernardo/) ubicada en: Barros Arana 796\nVentas\n+56 2 2859 1103\n+56 9 8500 7033\n+56 5 7276 2920\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Las Condes](https://limatco.cl/sucursal-lascondes/) ubicada en: Av. Las Condes 12803, Centro Comercial Portal la Cabaña\nVentas\n+56 2 3280 0371\nAtención a clientes\n+56 2 3280 0391\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Talagante](https://limatco.cl/sucursal-talagante/) ubicada en: Av. Bernardo O'Higgins 0225 (referencia Volcán Llaima 799)\nVentas\n+56 2 2938 1377\n+56 9 6159 8807\n+56 9 6354 6171\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Chicureo](https://limatco.cl/sucursal-chicureo/) ubicada en: Carretera General San Martín 6000, Local 119\nVentas\n+56 2 2733 5911\n+56 2 2733 5910\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs.\n\n[Sucursal Padre Hurtado](https://limatco.cl/sucursal-padre-hurtado/) ubicada en: Calle San Ignacio N° 1624, Locales 18 y 19, Centro Comercial Laguna del Sol\nVentas\n+56 9 9634 6019\n+56 9 9733 1068\nHorario de Atención\nLunes a Viernes 10:00 - 18:30 Hrs.\nSábado 10:00 - 14:00 Hrs. Sólamente en Limatco Vespucio y Limatco Independencia está disponible el retiro inmediato, en las demás sucursales de Limatco el pedido está listo al día siguiente. ";
+
+	public function __construct() {
+		add_action( 'rest_api_init', array( $this, 'register_routes' ) );
+	}
+
+	public function register_routes() {
+		register_rest_route(
+			self::NAMESPACE_ROUTE,
+			'/message', // composicion de mensajes en json
+			array(
+				'methods'             => 'POST', // evita que sea por get obligando a entrar al sitio web
+				'callback'            => array( $this, 'handle_message' ),
+				'permission_callback' => '__return_true', // Chat público
+				'args'                => array(
+					'message' => array(
+						'required'          => true,
+						'type'              => 'string',
+						'sanitize_callback' => 'sanitize_text_field',
+					),
+					'history' => array(
+						'required' => false,
+						'type'     => 'array',
+					),
+				),
+			)
+		);
+
+		// Refresh de wp-nonce para evitar que se cachee
+		register_rest_route(
+			self::NAMESPACE_ROUTE,
+			'/nonce',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( $this, 'handle_nonce' ),
+				'permission_callback' => '__return_true',
+			)
+		);
+
+		// Botón "Agregar" de una tarjeta de producto del chat: agrega el producto al carrito de WooCommerce.
+		register_rest_route(
+			self::NAMESPACE_ROUTE,
+			'/add-to-cart',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( $this, 'handle_add_to_cart' ),
+				'permission_callback' => '__return_true', // Activar o desactivar la respuesta (en caso de emergencias con spam)
+				'args'                => array(
+					'product_id' => array(
+						'required' => true,
+						'type'     => 'integer',
+					),
+				),
+			)
+		);
+	}
+
+	public function handle_nonce() {
+		$response = new WP_REST_Response( array( 'nonce' => wp_create_nonce( 'wp_rest' ) ), 200 );
+		// Evita que Cloudflare y navegadores cacheen el WP-Nonce.
+		$response->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+		return $response;
+	}
+
+	public function handle_message( WP_REST_Request $request ) {
+
+		if ( ! wp_verify_nonce( $request->get_header( 'X-WP-Nonce' ), 'wp_rest' ) ) {
+			error_log( 'Revisar si hay algún plugin de Caché, Cloudfare o modo administrador de WP activo' );
+			Limatco_Chat_Admin::log_error( 'nonce', 'lac_nonce_invalid', 'Nonce inválido o expirado en /message (revisar caché/Cloudflare/modo admin)', array(), 'warning' );
+			return new WP_REST_Response( array( 'error' => 'Nonce inválido o expirado, recargue la página' ), 403 );
+		}
+
+		$rate_limit_error = $this->check_rate_limit();
+		if ( is_wp_error( $rate_limit_error ) ) {
+			error_log( 'Error 429' );
+			Limatco_Chat_Admin::log_error( 'rate_limit', $rate_limit_error->get_error_code(), $rate_limit_error->get_error_message(), array(), 'warning' );
+			return new WP_REST_Response( array( 'error' => $rate_limit_error->get_error_message() ), 429 );
+		}
+
+		$user_message = trim( $request->get_param( 'message' ) );
+		if ( empty( $user_message ) ) {
+			error_log( 'Error 400' );
+			return new WP_REST_Response( array( 'error' => 'Mensaje vacío, escriba su consulta para que le podamos ayudar' ), 400 );
+			error_log(
+			    'LIMATCO QUERY [' . current_time( 'mysql' ) . '] ' .
+    			'Usuario: "' . $user_message . '" | ' .
+    			'Búsqueda ejecutada: "' . $term . '"'
+			);
+		}
+		if ( mb_strlen( $user_message ) > 200 ) {
+			return new WP_REST_Response( array( 'error' => 'Mensaje demasiado largo (máximo 200 caracteres).' ), 400 );
+		}
+
+		$history = $request->get_param( 'history' );
+		if ( ! is_array( $history ) ) {
+			$history = array(); // 
+		}
+
+		// Respuesta fija para contacto telefónico/ejecutivo: Respuestas hardcodeadas
+		// Las preguntas de sucursales, ($is_branches_query) sí ocupan tokens
+		$hardcoded_reply = $this->check_hardcoded_reply( $user_message );
+		if ( null !== $hardcoded_reply ) {
+			return new WP_REST_Response(
+				array(
+					'reply'    => $this->markdown_to_html( $hardcoded_reply ),
+					'products' => array(),
+				),
+				200
+			);
+		}
+
+		// Ficha técnica: respuesta directa con el campo Descripción del producto (sin IA, sin tokens).
+		if ( $this->is_datasheet_query( $user_message ) ) {
+			return $this->handle_datasheet( $user_message );
+		}
+
+		$api_key = get_option( 'lac_api_key', '' );
+		if ( empty( $api_key ) ) {
+			error_log( 'No hay API configurada en el sistema' );
+			Limatco_Chat_Admin::log_error( 'config', 'lac_no_api_key', 'No hay API key configurada en los ajustes del plugin' );
+			return new WP_REST_Response( array( 'error' => 'Espere un momento y recargue la página' ), 500 );
+		}
+
+		$model = get_option( 'lac_model', 'gemini-2.0-flash' );
+
+		// 1.- Clasifica la consulta (categoría + keywords + si corresponde buscar productos).
+		// Se le pasa el historial para que pueda interpretar respuestas de
+		// seguimiento (ej. el usuario responde "en dormitorio" a una pregunta
+		// aclaratoria previa) en vez de clasificar el mensaje aislado.
+		$sku_hit     = $this->extract_sku_query( $user_message );
+		$sku_context = null;
+		if ( null !== $sku_hit ) {
+			$sku_context = Limatco_Chat_Context::get_context_for_sku( $sku_hit['sku'] );
+			if ( empty( $sku_context['products'] ) && ! $sku_hit['explicit'] ) {
+				$sku_context = null;
+			}
+		}
+
+		if ( null !== $sku_context ) {
+			$classification = array(
+				'category'          => '',
+				'keywords'          => $sku_hit['sku'],
+				'needs_search'      => false,
+				'colores'           => array(),
+				'single_color_only' => false,
+				'atributos'         => array(),
+				'sku_lookup'        => true,
+			);
+		} else {
+			$classification = $this->classify_query( $api_key, $model, $user_message, $history );
+		}
+
+		if ( is_wp_error( $classification ) ) {
+			// Si falla la clasificación, seguimos igual pero sin filtro de categoría ni atributos.
+			Limatco_Chat_Admin::log_error(
+				'classifier',
+				$classification->get_error_code(),
+				$classification->get_error_message() . ' (se continuó sin filtro de categoría)',
+				array( 'query' => $user_message, 'model' => $model ),
+				'warning'
+			);
+			$classification = array(
+				'category'          => '',
+				'keywords'          => $user_message,
+				'needs_search'      => true,
+				'colores'           => array(),
+				'single_color_only' => false,
+				'atributos'         => array(),
+			);
+		}
+
+		$is_branches_query = $this->is_branches_query( $user_message );
+
+		// Búsqueda por nombre de producto en todo el catálogo (ej. "porcelanato mila", "cerámica flower blue").
+		// Si ningún título calza, $name_context queda null y sigue la cascada normal.
+		$name_context = null;
+		if ( null === $sku_context && ! $is_branches_query && ! empty( $classification['product_name'] ) ) {
+			$name_context = Limatco_Chat_Context::get_context_for_name(
+				$classification['product_name'],
+				array_merge( $classification['colores'], array_values( $classification['atributos'] ) )
+			);
+		}
+
+		// "oferta/rebaja/descuento/remate" -> solo productos en oferta.
+		// "económico/barato" (incluye "X más barato") -> ordenar de menor a mayor precio.
+		// Detección por palabra clave (igual que is_branches_query): son intenciones de
+		// filtro/orden sobre la búsqueda, no dependen de la clasificación por IA.
+		$wants_on_sale   = $this->is_sale_query( $user_message );
+		$wants_cheapest  = $this->is_cheap_query( $user_message );
+		if ( null !== $sku_context || null !== $name_context ) {
+			$wants_on_sale  = false;
+			$wants_cheapest = false;
+		}
+
+		// 2.- Buscar en WooCommerce con esa categoría/keywords/atributos SOLO si el mensaje es
+		// realmente sobre productos. Si no (ej. "hola", "gracias", o una pregunta de
+		// sucursales/horarios), evitamos la búsqueda: con categoría/keywords vacías la
+		// cascada terminaba trayendo productos al azar del catálogo para un simple saludo.
+		// "oferta"/"barato" son siempre intención de búsqueda de producto, aunque el
+		// clasificador (needs_search) se equivoque con un mensaje corto tipo "ofertas".
+		if ( null !== $sku_context ) {
+			$context_data = $sku_context;
+		} elseif ( null !== $name_context ) {
+			$context_data = $name_context;
+		} elseif ( ( ! empty( $classification['needs_search'] ) || $wants_on_sale || $wants_cheapest ) && ! $is_branches_query ) {
+			// get_context_for_query() devuelve el texto para el prompt de la IA
+			// y, aparte, la data (imagen/precio/stock/oferta) para las tarjetas del widget.
+			$context_data = Limatco_Chat_Context::get_context_for_query(
+				$classification['category'],
+				$classification['keywords'],
+				$classification['colores'],
+				$classification['single_color_only'],
+				$classification['atributos'],
+				$classification['product_type'] ?? '',
+				$wants_on_sale,
+				$wants_cheapest
+			);
+		} else {
+			$context_data = array(
+				'text'     => 'El usuario no está buscando un producto en este mensaje (ej. saludo, agradecimiento, pregunta de sucursales/horarios u otro comentario). No muestres ni menciones productos; responde solo de forma natural a lo que dijo.',
+				'products' => array(),
+			);
+		}
+
+		// 3.- Responder usando SOLO esos productos como contexto, con instrucciones de formato para que la respuesta sea legible (headers, listas, links) en vez de un volcado rígido de campos.
+		$system_prompt = get_option( 'lac_system_prompt', '' );
+		$full_system   = $system_prompt . "\n\n" . self::RESPONSE_FORMAT_INSTRUCTIONS . "\n\n--- Acorde a su consulta:\n" . $context_data['text'];
+
+		// Se agrega SOLO si la pregunta parece ser de sucursales/horarios/contacto, para no
+		// gastar tokens de más en cada mensaje. La IA responde específicamente a lo que se
+		// preguntó (ej. el horario de una sola sucursal) usando este contexto, no un texto fijo.
+		if ( $is_branches_query ) {
+			$full_system .= "\n\n--- Información de sucursales (dirección, teléfonos, horario). Responde solo con lo que se pregunte, no vuelques todo el listado salvo que el usuario pida ver todas las sucursales:\n" . self::BRANCHES_CONTEXT;
+		}
+
+		if ( null !== $sku_context ) {
+			$full_system .= "\n\n--- El usuario buscó por código SKU/código Limatco. El contexto de arriba es la coincidencia exacta de ese código (o indica que no existe).";
+		}
+
+		if ( null !== $name_context ) {
+			$full_system .= "\n\n--- El usuario buscó un producto por su nombre. El contexto de arriba son las coincidencias por nombre en todo el catálogo.";
+		}
+
+		if ( $wants_on_sale ) {
+			$full_system .= "\n\n--- Los productos de arriba ya están filtrados: son SOLO productos en oferta/rebaja. Menciónalo brevemente en tu respuesta.";
+		}
+		if ( $wants_cheapest ) {
+			$full_system .= "\n\n--- Los productos de arriba ya están ordenados de menor a mayor precio (el más económico primero).";
+		}
+
+		// Glosario técnico: solo se paga el costo de tokens cuando efectivamente hay
+		// productos en el contexto (evita cargarlo en saludos, sucursales, sin resultados, etc.).
+		if ( count( $context_data['products'] ) > 0 ) {
+			$full_system .= "\n\n--- Glosario de términos técnicos del catálogo (úsalo para interpretar/explicar, no lo repitas tal cual):\n" . self::TECHNICAL_TERMS_CONTEXT;
+		}
+
+		// Debug completo de mensajes de IA, incluye Query, Clasificacion, Prompt, Historial, resultados, finalizacion, safety y respuesta.
+		$messages    = $this->build_messages( $history, $user_message );
+		$t_start     = microtime( true );
+		$gemini_result = $this->call_gemini_api( $api_key, $model, $full_system, $messages, 1200 );
+		$t_elapsed   = round( microtime( true ) - $t_start, 2 );
+
+		// [01]-[10] structured debug log
+		$wc_count = count( $context_data['products'] );
+		$raw_data = ! is_wp_error( $gemini_result ) ? ( $gemini_result['raw'] ?? array() ) : array();
+		$usage    = $raw_data['usage'] ?? array();
+		$choice   = $raw_data['choices'][0] ?? array();
+		error_log( '[01] QUERY: '         . $user_message );
+		error_log( '[02] CLASSIFICATION: '. wp_json_encode( $classification, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+		error_log( '[03] PROMPT: '        . mb_strlen( $full_system ) . ' chars' );
+		error_log( '[04] HISTORY: '       . count( $history ) . ' messages' );
+		error_log( '[05] WC_RESULTS: '    . $wc_count );
+		if ( ! is_wp_error( $gemini_result ) ) {
+			$finish      = $choice['finish_reason'] ?? 'N/A';
+			$out_tokens  = $usage['completion_tokens'] ?? ( $usage['output_tokens'] ?? 'N/A' );
+			$avg_logprob = $choice['logprobs']['content'][0]['logprob'] ?? 'N/A';
+			error_log( '[06] GEMINI: finish=' . $finish . ' | output_tokens=' . $out_tokens . ' | avg_logprob=' . $avg_logprob );
+			$safety = $raw_data['promptFeedback']['safetyRatings'] ?? array();
+			error_log( '[07] GEMINI_SAFETY: ' . wp_json_encode( $safety, JSON_UNESCAPED_UNICODE ) );
+			error_log( '[08] GEMINI_RESPONSE: ' . wp_json_encode( $choice['message'] ?? array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+		}
+
+		$response = is_wp_error( $gemini_result ) ? $gemini_result : $gemini_result['text'];
+
+		if ( is_wp_error( $response ) ) {
+
+    	$error_code    = $response->get_error_code();
+    	$error_message = $response->get_error_message();
+    	$error_data    = $response->get_error_data();
+
+    $http_code = is_array( $error_data ) && isset( $error_data['http_code'] )
+        ? $error_data['http_code']
+        : 'N/A';
+
+    $api_code = is_array( $error_data ) && isset( $error_data['api_code'] )
+        ? $error_data['api_code']
+        : 'N/A';
+
+    $status = is_array( $error_data ) && isset( $error_data['status'] )
+        ? $error_data['status']
+        : $error_code;
+
+    error_log(
+        sprintf(
+            '[GEMINI ERROR] HTTP: %s | API Code: %s | Status: %s | Message: %s',
+            $http_code,
+            $api_code,
+            $status,
+            $error_message
+        )
+    );
+
+    Limatco_Chat_Admin::log_error(
+        'gemini',
+        $error_code,
+        $error_message,
+        array(
+            'http_code' => $http_code,
+            'api_code'  => $api_code,
+            'status'    => $status,
+            'model'     => $model,
+            'query'     => $user_message,
+        )
+    );
+
+    return new WP_REST_Response(
+        array(
+            'error' => 'Error al intentar crear una respuesta. Vuelva a intentar en unos momentos.'
+        ),
+        502
+    );
+}
+		// Debug de productos finales post shuffle y tiempo total de incio a final. (solo cuando hay tarjetas de productos)
+		error_log( '[09] FINAL_PRODUCTS: ' . count( $context_data['products'] ) );
+		error_log( '[10] TOTAL_TIME: '    . $t_elapsed . 's' );
+
+		// Construye los enlaces de "Ver más en catálogo":
+		// 1. URL de la categoría WC (archivo de la familia detectada).
+		// 2. URL de búsqueda query /?s=valor&post_type=product por cada atributo.
+		// 3. URL combinada: categoría + query del atributo en la misma URL.
+		$search_links = array();
+		if ( ! empty( $classification['needs_search'] ) && count( $context_data['products'] ) > 0 ) {
+
+			$cat_url = '';
+			$cat_label = '';
+
+			// ── Categoría ──────────────────────────────────────────────────────
+			if ( ! empty( $classification['category'] ) ) {
+				$cat_term = get_term_by( 'slug', $classification['category'], 'product_cat' );
+				if ( $cat_term && ! is_wp_error( $cat_term ) ) {
+					$raw_cat_url = get_term_link( $cat_term );
+					if ( ! is_wp_error( $raw_cat_url ) ) {
+						$cat_url   = $raw_cat_url;
+						$cat_label = $cat_term->name;
+						$search_links[] = array(
+							'label' => $cat_label,
+							'url'   => add_query_arg( array( 'utm_medium' => 'chatbot' ), $cat_url ),
+							'type'  => 'category',
+						);
+					}
+				}
+			}
+
+			// ── Atributos: query sola + categoría+query ─────────────────────────
+			// En vez de buscar por taxonomía de atributo, se genera una búsqueda
+			// ?s=valor&post_type=product para que el usuario vea los resultados
+			// de búsqueda nativos de WooCommerce con ese término.
+			if ( ! empty( $classification['atributos'] ) && is_array( $classification['atributos'] ) ) {
+				foreach ( $classification['atributos'] as $attr_slug => $attr_value ) {
+					if ( '' === $attr_value ) {
+						continue;
+					}
+
+					$search_term = sanitize_text_field( $attr_value );
+
+					// Link 2: solo query — home_url() + ?s=valor&post_type=product
+					$query_only_url = add_query_arg(
+						array(
+							's'             => $search_term,
+							'post_type'     => 'product',
+							'utm_source'    => 'limatco',
+							'utm_medium'    => 'chatbot',
+						),
+						home_url( '/' )
+					);
+					$search_links[] = array(
+						'label' => $search_term,
+						'url'   => $query_only_url,
+						'type'  => 'search_query',
+					);
+
+					// Link 3: categoría + query — solo si tenemos URL de categoría
+					if ( '' !== $cat_url ) {
+						$combined_url = add_query_arg(
+							array(
+								's'          => $search_term,
+								'post_type'  => 'product',
+								'utm_source' => 'limatco',
+								'utm_medium' => 'chatbot',
+							),
+							$cat_url
+						);
+						$search_links[] = array(
+							'label' => $cat_label . ' · ' . $search_term,
+							'url'   => $combined_url,
+							'type'  => 'category_query',
+						);
+					}
+				}
+			}
+		}
+
+
+		return new WP_REST_Response(
+			array(
+				'reply'        => $this->markdown_to_html( $response ),
+				'products'     => $context_data['products'],
+				'search_links' => $search_links,
+			),
+			200
+		);
+	}
+
+	/** Recibe el product_id del botón "Agregar" de una tarjeta de producto en el chat y lo agrega al carrito de WooCommerce vía WC()->cart->add_to_cart(). */
+	public function handle_add_to_cart( WP_REST_Request $request ) {
+
+		if ( ! wp_verify_nonce( $request->get_header( 'X-WP-Nonce' ), 'wp_rest' ) ) {
+			error_log( 'Revisar si hay algún plugin de Caché, Cloudfare o modo administrador de WP activo' );
+			Limatco_Chat_Admin::log_error( 'nonce', 'lac_nonce_invalid', 'Nonce inválido o expirado en agregar al carrito', array(), 'warning' );
+			return new WP_REST_Response( array( 'error' => 'Nonce inválido o expirado, recargue la página' ), 403 );
+		}
+
+		if ( ! function_exists( 'wc_load_cart' ) || ! function_exists( 'wc_get_product' ) ) {
+			error_log( 'WooCommerce no está activo, no se puede agregar al carrito' );
+			Limatco_Chat_Admin::log_error( 'woocommerce', 'lac_wc_inactive', 'WooCommerce no está activo, no se puede agregar al carrito' );
+			return new WP_REST_Response( array( 'error' => 'WooCommerce no está activo en este sitio.' ), 500 );
+		}
+
+		// En una request REST el carrito/sesión de WooCommerce no siempre queda inicializado como en una visita normal al frontend.
+		wc_load_cart();
+
+		$product_id = absint( $request->get_param( 'product_id' ) );
+		$product    = wc_get_product( $product_id );
+
+		if ( ! $product || ! $product->is_purchasable() || ! $product->is_in_stock() ) {
+			return new WP_REST_Response( array( 'error' => 'Este producto ya no está disponible.' ), 400 );
+		}
+
+		$added = WC()->cart->add_to_cart( $product_id, 1 );
+
+		if ( ! $added ) {
+			error_log( "No se pudo agregar el producto {$product_id} al carrito desde el chat" );
+			Limatco_Chat_Admin::log_error( 'add_to_cart', 'lac_add_to_cart_failed', 'WC()->cart->add_to_cart() devolvió false', array( 'product_id' => $product_id ) );
+			return new WP_REST_Response( array( 'error' => 'No se pudo agregar el producto al carrito.' ), 500 );
+		}
+
+		return new WP_REST_Response(
+			array(
+				'success'    => true,
+				'cart_count' => WC()->cart->get_cart_contents_count(),
+			),
+			200
+		);
+	}
+
+	/** Paso 1: llamada rápida y barata que le pide al modelo devolver SOLO un JSON con la categoría (de las categorías reales de WooCommerce), las keywords de búsqueda y si el mensaje amerita buscar productos (needs_search), a partir del mensaje. Recibe el historial reciente para poder interpretar respuestas de seguimiento (ej. "en dormitorio") que por sí solas no dicen qué producto se busca. @return array{category:string,keywords:string,needs_search:bool}|WP_Error */
+	private function classify_query( $api_key, $model, $user_message, $history = array() ) {
+		$categories = Limatco_Chat_Context::get_available_categories();
+		$category_list = ! empty( $categories ) ? implode( ', ', array_values( $categories ) ) : '(sin categorías registradas)';
+
+		$system = "Clasificador de mensajes sobre productos de construcción (Limatco). Analiza el MENSAJE MÁS RECIENTE"
+			. "en el contexto de los turnos previos (puede ser respuesta a una aclaración, no consulta aislada). "
+			. "Responde SOLO este JSON, sin texto extra:\n"
+			. '{"category": "<una de: ' . $category_list . ' o vacío>", "keywords": "<2-5 palabras>", "needs_search": <true|false>, '
+			. '"nombre_producto": "<nombre/modelo propio de un producto concreto si el usuario lo menciona, ej. Mila, Flower Blue; vacío si no>", '
+			. '"colores": [<lista de colores predominantes pedidos, ej ["blanco"] o ["blanco","gris"], vacío si no aplica>], '
+			. '"single_color_only": <true SOLO si el usuario pidió explícitamente un color puro/sin combinar, si no false>, '
+			. '"atributos": {"formato": "<ej. 60x60, o vacío>", "terminacion": "<ej. antideslizante/R10/R11, o vacío>", "estetica-o-diseno": "<ej. madera/madera tipo tabla/cemento/marmol/decorado/monocolor, o vacío>", "acabado": "<ej. mate/satinado/texturado, o vacío>", "cantos-o-bordes": "<ej. rectificado/encastre, o vacío>", "caras-o-destonalizado": "<vacío salvo que el usuario lo pida explícito>"}}' . "\n\n"
+			. "needs_search=false SOLO si el mensaje no trata de productos/servicios Limatco (saludos, agradecimientos, despedidas, small talk, preguntas del bot). Cualquier búsqueda/pregunta/respuesta de seguimiento sobre producto, aunque sea vaga, => true. Si false: category, keywords, colores y atributos van vacíos.\n\n"
+			. "Reglas de colores/atributos:\n"
+			. "- Identifica por separado: categoría, marca, modelo/nombre específico, características o uso, y otros términos útiles.\n"
+			. "- 'colores' son SOLO los colores predominantes reales del producto (ej. 'cerámica blanca' -> [\"blanco\"]); no confundir con ambiente/estilo.\n"
+			. "- Si el usuario pide 2+ colores combinados a la vez (ej. 'blanco y gris'), ponlos en la lista SOLO si el usuario quiere esa combinación específica en el mismo producto. 'Blanca con detalles grises' o 'principalmente blanca con vetas grises' = [\"blanco\"] (el blanco es el predominante; el gris es un detalle secundario, NO un segundo color requerido).\n"
+			. "- 'single_color_only' es true SOLO si el usuario dice explícitamente que sea de un solo color / puro / sin combinar / liso; en cualquier otro caso, false.\n"
+			. "- Colores con calificador (ej. 'gris claro', 'gris oscuro', 'beige claro') -> mantener el calificador en el color: [\"gris claro\"]. No separar ni simplificar.\n"
+			. "- 'antideslizante' o 'que no resbale' (baño, terraza, piscina, exterior en general) -> atributos.terminacion = 'antideslizante'. Si mencionan un código R explícito (R9-R13), respétalo tal cual.\n"
+			. "- Si el usuario da una medida (ej. '19x57', '60x120'), va en atributos.formato tal cual la escribió.\n"
+			. "- 'tipo tabla' NO significa simplemente 'madera'. En este catálogo, cuando el usuario pide 'tipo tabla', 'tabla' o 'madera tipo tabla', usa atributos.estetica-o-diseno = 'madera tipo tabla'. Si además pide una medida, conserva también atributos.formato.\n"
+			. "- Si el usuario pide 'otras alternativas en otros formatos' pero mantiene 'tipo tabla', elimina SOLO el formato anterior y conserva estetica-o-diseno = 'madera tipo tabla'.\n"
+			. "- Estética/diseño: mapea las expresiones del usuario al valor más cercano de esta lista: madera / madera tipo tabla / cemento / mármol / decorado / monocolor / piedra / hidráulico / rústico. Ejemplos: 'tipo mármol' -> 'mármol', 'estilo piedra' -> 'piedra', 'aspecto cemento' -> 'cemento', 'imitación madera' -> 'madera', 'estampado' -> 'decorado', 'hidráulico' -> 'hidráulico'.\n"
+			. "- 'revestimiento' o 'revestimiento de pared': usa como keyword 'revestimiento'; NO lo pongas en estetica-o-diseno. La categoría puede ser cerámica o porcelanato según el material pedido.\n"
+			. "- Una medida explícita (60x60, 60x120, 30x30, etc.) es un filtro obligatorio y no debe convertirse en una keyword.\n"
+			. "- No inventes ningún valor de atributo que el usuario no haya mencionado o insinuado con claridad; deja vacío si no aplica.\n\n"
+			. "Regla de nombre_producto: es el nombre o modelo propio de un producto/colección concreto que el usuario mencione (ej. 'porcelanato Mila' -> 'Mila'; 'cerámica Flower Blue' -> 'Flower Blue'). Sin material (cerámica/porcelanato), sin colores, estilos genéricos (blanca, madera, mármol) ni medidas. Una marca sola (Crest, Cerámica Chile) NO es nombre_producto. Si el usuario busca por características/uso/marca y no por un nombre propio, déjalo vacío.\n\n"
+			. "Reglas de keywords:\n"
+			. "- Si el usuario menciona una marca, la marca es una keyword de alta prioridad. Ejemplos: adhesivos Crest → categoría=adhesivos, keywords=Crest .\n"
+			. "- Deben aparecer LITERAL en nombre/descripción del producto (se buscan por separado); solo términos que aporten.\n"
+			. "- Ambiente (dormitorio/living/sala/pieza/comedor/cocina/baño) -> 'interior'. Exterior (terraza/patio/jardín/piscina) -> 'exterior'. Tránsito alto/comercial/local/negocio -> 'alto tránsito'. Nivel PEI explícito -> respétalo tal cual (ej. 'PEI 4').\n"
+			. "- No inventes ni agregues color/tono/estilo como keyword (el color ya va en 'colores', la medida en formato y el diseño en estetica-o-diseno) salvo que el usuario haya dado un término muy específico y ya haya funcionado antes en la conversación.\n"
+			. "- Mensaje vago/confirmación sin términos nuevos ('todas las alternativas','cualquiera','sí','muéstrame más','recomiéndame') -> ignóralo como keyword y usa el producto/ambiente ya buscado en turnos previos. Nunca devuelvas la frase vaga tal cual.\n"
+			. "- Tono/estilo/diseño equivalen entre sí (ej. 'tono madera'='estilo madera'='diseño madera'): usa el término del cliente. 'Hidráulicos' = 'Decorados'.";
+
+
+		// Últimos turnos de mensajes alcanzan para resolver respuestas de seguimiento.
+		$recent_history = array_slice( $history, -3 ); // Se pasó de 6 a 3 mensaje debido a que el historial acumulado puede arruinar las nuevas consultas con colores o demás taxonomias.
+
+		$messages = array();
+		foreach ( $recent_history as $turn ) {
+			if ( empty( $turn['role'] ) || empty( $turn['content'] ) ) {
+				continue;
+			}
+			$content = trim( sanitize_text_field( $turn['content'] ) );
+			if ( '' === $content ) {
+				continue;
+			}
+			$messages[] = array(
+				'role'    => ( 'assistant' === $turn['role'] ) ? 'assistant' : 'user',
+				'content' => $content,
+			);
+		}
+		$messages[] = array( 'role' => 'user', 'content' => $user_message );
+
+		// Resultados en Json bruto
+		$raw_result = $this->call_gemini_api( $api_key, $model, $system, $messages, 1000 ); // Se aumenta el límite de 300 a 1000 tokens para evitar quedarse sin respuesta de productos, productos por query pasan de 5 a 10.
+
+		if ( is_wp_error( $raw_result ) ) {
+			return $raw_result;
+		}
+
+		$raw  = $raw_result['text']; // Presentar json en texto. PENDIENTE: BUSCAR CÓMO EVITAR ATAQUES DE INYECCION DE JSON
+		$json = json_decode( trim( $raw ), true );
+		if ( ! is_array( $json ) ) {
+			return new WP_Error( 'lac_classify_parse_error', 'No se pudo interpretar la clasificación.' );
+		}
+
+		$category_name = isset( $json['category'] ) ? sanitize_text_field( $json['category'] ) : '';
+		$keywords      = isset( $json['keywords'] ) ? sanitize_text_field( $json['keywords'] ) : $user_message;
+		$product_type  = isset( $json['product_type'] ) ? sanitize_text_field( (string) $json['product_type'] ) : '';
+		$product_name  = isset( $json['nombre_producto'] ) ? sanitize_text_field( (string) $json['nombre_producto'] ) : '';
+
+		// El modelo devuelve el NOMBRE de la categoría (posiblemente con prefijo padre
+		// "Cerámicas Piso > Marmolados y Decorados"). array_search busca el slug exacto.
+		$slug = array_search( $category_name, $categories, true );
+
+		// Si el slug no coincidió (el modelo devolvió solo el nombre corto sin prefijo,
+		// ej. "Marmolados y Decorados" en vez de "Cerámicas Piso > Marmolados y Decorados"),
+		// buscamos todos los slugs cuyo label termina en ese nombre y, si hay product_type,
+		// preferimos el que cuyo label contiene una palabra clave del tipo de producto.
+		if ( ! $slug && '' !== $category_name ) {
+			$pt_normalized = mb_strtolower( remove_accents( $product_type ), 'UTF-8' );
+			$candidates    = array();
+			foreach ( $categories as $cat_slug => $cat_label ) {
+				// El label puede ser "Padre > Nombre" o solo "Nombre".
+				$label_end = mb_strtolower( remove_accents( $cat_label ), 'UTF-8' );
+				$name_norm = mb_strtolower( remove_accents( $category_name ), 'UTF-8' );
+				if ( $label_end === $name_norm || substr( $label_end, -mb_strlen( $name_norm ) ) === $name_norm ) {
+					$candidates[ $cat_slug ] = $cat_label;
+				}
+			}
+			if ( count( $candidates ) === 1 ) {
+				$slug = array_key_first( $candidates );
+			} elseif ( count( $candidates ) > 1 && '' !== $pt_normalized ) {
+				// Varios slugs con el mismo nombre corto: elegir el que tenga product_type en el prefijo.
+				foreach ( $candidates as $cat_slug => $cat_label ) {
+					if ( false !== strpos( mb_strtolower( remove_accents( $cat_label ), 'UTF-8' ), $pt_normalized ) ) {
+						$slug = $cat_slug;
+						break;
+					}
+				}
+				// Si ninguno matcheó el product_type en el label, dejamos $slug en false
+				// para que la cascada busque sin categoría y product_type actúe como keyword.
+			}
+		}
+
+		// Colores predominantes pedidos, ya sanitizados; se descartan valores vacíos por si el modelo devuelve "" dentro del array.
+		$colores = array();
+		if ( isset( $json['colores'] ) && is_array( $json['colores'] ) ) {
+			foreach ( $json['colores'] as $color ) {
+				$color = sanitize_text_field( (string) $color );
+				if ( '' !== $color ) {
+					$colores[] = $color;
+				}
+			}
+		}
+
+		// Filtros de atributo adicionales (formato, terminación, etc.); mismos slugs que ATTRIBUTE_LABELS en Limatco_Chat_Context.
+		$atributos = array();
+		if ( isset( $json['atributos'] ) && is_array( $json['atributos'] ) ) {
+			foreach ( $json['atributos'] as $attr_slug => $attr_value ) {
+				$attr_value = sanitize_text_field( (string) $attr_value );
+				if ( '' !== $attr_value ) {
+					$atributos[ sanitize_text_field( (string) $attr_slug ) ] = $attr_value;
+				}
+			}
+		}
+
+		return array(
+			'category'          => $slug ? $slug : '',
+			'keywords'          => $keywords,
+			'needs_search'      => ! isset( $json['needs_search'] ) || (bool) $json['needs_search'],
+			'colores'           => $colores,
+			'single_color_only' => ! empty( $json['single_color_only'] ),
+			'atributos'         => $atributos,
+			'product_type'      => $product_type,
+			'product_name'      => $product_name,
+		);
+	}
+
+	/** Se exigen roles alternados (user, assistant), que el primer mensaje sea "user" y que ningún content venga vacío. */
+	private function build_messages( $history, $user_message ) {
+		$raw = array();
+
+		$max_turns = 4; 
+		$history   = array_slice( $history, -1 * $max_turns * 2 );
+
+		foreach ( $history as $turn ) {
+			if ( empty( $turn['role'] ) || empty( $turn['content'] ) ) {
+				continue;
+			}
+			$content = trim( sanitize_text_field( $turn['content'] ) );
+			if ( '' === $content ) {
+				continue;
+			}
+			$role  = ( 'assistant' === $turn['role'] ) ? 'assistant' : 'user';
+			$raw[] = array(
+				'role'    => $role,
+				'content' => $content,
+			);
+		}
+
+		// Debe empezar en "user": si el primer turno guardado es del bot (ej. saludo inicial), se descarta.
+		while ( ! empty( $raw ) && 'assistant' === $raw[0]['role'] ) {
+			array_shift( $raw );
+		}
+
+		// Colapsar turnos consecutivos del mismo rol (evita el 400 de la API si el front-end duplica un mensaje).
+		$messages = array();
+		foreach ( $raw as $turn ) {
+			$last_index = count( $messages ) - 1;
+			if ( $last_index >= 0 && $messages[ $last_index ]['role'] === $turn['role'] ) {
+				$messages[ $last_index ]['content'] .= "\n" . $turn['content'];
+				continue;
+			}
+			$messages[] = $turn;
+		}
+
+		// El mensaje nuevo del usuario nunca debe quedar duplicado ni pegado a otro turno "user" sin alternar.
+		$last_index = count( $messages ) - 1;
+		if ( $last_index >= 0 && 'user' === $messages[ $last_index ]['role'] ) {
+			$messages[ $last_index ]['content'] .= "\n" . $user_message;
+		} else {
+			$messages[] = array(
+				'role'    => 'user',
+				'content' => $user_message,
+			);
+		}
+
+		return $messages;
+	}
+
+	/** Convierte carácteres de Markdown (negrita, links, listas) a HTML. */
+	private function markdown_to_html( $text ) {
+	$html = htmlspecialchars( $text, ENT_QUOTES, 'UTF-8' );
+	$html = preg_replace( '/\[([^\]]+)\]\(([^)]+)\)/', '<a href="$2" target="_blank" rel="noopener">$1</a>', $html );
+	$html = preg_replace( '/\*\*(.+?)\*\*/', '<strong>$1</strong>', $html );
+
+	$lines   = explode( "\n", $html );
+	$out     = array();
+	$in_list = false;
+
+	foreach ( $lines as $line ) {
+		if ( preg_match( '/^[-*]\s+(.*)/', $line, $m ) ) {
+			if ( ! $in_list ) {
+				$out[]   = '<ul>';
+				$in_list = true;
+			}
+			$out[] = '<li>' . $m[1] . '</li>';
+		} else {
+			if ( $in_list ) {
+				$out[]   = '</ul>';
+				$in_list = false;
+			}
+			$out[] = ( '' === trim( $line ) ) ? '' : '<p>' . $line . '</p>';
+		}
+	}
+	if ( $in_list ) {
+		$out[] = '</ul>';
+	}
+
+	return implode( '', $out );
+}
+	/** Llamada genérica a la API de Gemini, reutilizada para clasificar (paso 1) y responder (paso 3). el prompt de sistema va como un mensaje más dentro de "messages", con role:"system". */
+	private function call_gemini_api( $api_key, $model, $system_prompt, $messages, $max_tokens ) {
+		$full_messages = array();
+		if ( '' !== trim( (string) $system_prompt ) ) {
+			$full_messages[] = array(
+				'role'    => 'system',
+				'content' => $system_prompt,
+			);
+		}
+		foreach ( $messages as $message ) {
+			$full_messages[] = $message;
+		}
+
+		$body = array(
+			'model'      => $model,
+			'max_tokens' => $max_tokens,
+			'messages'   => $full_messages,
+		);
+
+		$response = wp_remote_post(
+			self::GEMINI_ENDPOINT,
+			array(
+				'headers' => array(
+					'Authorization' => 'Bearer ' . $api_key,
+					'content-type'  => 'application/json',
+				),
+				'body'    => wp_json_encode( $body ),
+				// Con historial largo + respuesta de 1200 tokens, 30s de espera puede no alcanzar.
+				'timeout' => 45,
+			)
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$status = wp_remote_retrieve_response_code( $response );
+		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		if ( $status < 200 || $status >= 300 ) {
+			$message = isset( $data['error']['message'] ) ? $data['error']['message'] : 'Error desconocido al llamar a la API.';
+			return new WP_Error(
+				'lac_api_error',
+				$message,
+				array(
+					'http_code' => $status,
+					'api_code'  => isset( $data['error']['code'] ) ? $data['error']['code'] : 'N/A',
+					'status'    => isset( $data['error']['status'] ) ? $data['error']['status'] : 'lac_api_error',
+				)
+			);
+		}
+
+		$text = isset( $data['choices'][0]['message']['content'] ) ? $data['choices'][0]['message']['content'] : '';
+
+		if ( empty( $text ) ) {
+			return new WP_Error( 'lac_empty_reply', 'La API no devolvió texto.' );
+		}
+
+		// Devolvemos texto + metadatos (usage, safety, finish_reason) para los logs [06]-[08].
+		return array( 'text' => $text, 'raw' => $data );
+	}
+
+	/**
+	 * Detecta la intención de contacto telefónico/ejecutivo por palabras clave, sin gastar tokens.
+	 * Se normaliza a minúsculas y sin tildes para que coincida
+	 */
+	private function check_hardcoded_reply( $user_message ) {
+		$normalized = strtolower( remove_accents( $user_message ) );
+
+		$phone_triggers = array(
+			'central cotizaciones',
+			'necesito comunicarme con un ejecutivo',
+			'quisiese comunicarme con un ejecutivo',
+			'comunicarme con un ejecutivo',
+			'hablar con un ejecutivo',
+			'contactar a un ejecutivo',
+			'llamada',
+			'telefono',
+			'numero telefonico',
+			'numero de telefono',
+			'asesor humano',
+			'comunicarme con un vendedor',
+		);
+		foreach ( $phone_triggers as $trigger ) {
+			if ( false !== strpos( $normalized, $trigger ) ) {
+				return self::PHONE_REPLY;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Detecta si el mensaje pregunta por sucursales, direcciones, horarios de atención o contacto de una tienda en particular. 
+	 * estoe NO devuelve una respuesta fija como check_hardcoded_reply(),: solo decide si se agrega BRANCHES_CONTEXT al contexto
+
+	 */
+	private function is_branches_query( $user_message ) {
+		$normalized = strtolower( remove_accents( $user_message ) );
+
+		$branch_triggers = array(
+			'sucursal',
+			'sucursales',
+			'direccion',
+			'direcciones',
+			'ubicacion',
+			'ubicaciones',
+			'donde queda',
+			'donde estan',
+			'donde estan ubicados',
+			'horario de atencion',
+			'horarios de atencion',
+			'a que hora abren',
+			'a que hora cierran',
+		);
+		foreach ( $branch_triggers as $trigger ) {
+			if ( false !== strpos( $normalized, $trigger ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Extrae un posible SKU del mensaje. 'explicit' = el usuario lo precedió con sku/código/cod/código limatco;
+	 * si no, solo se acepta un mensaje que sea únicamente un token con dígitos. El token debe tener al menos un dígito.
+	 *
+	 * @return array{sku:string,explicit:bool}|null
+	 */
+	private function extract_sku_query( $user_message ) {
+		$normalized = remove_accents( trim( $user_message ) );
+
+		$pattern = '/\b(?:sku|codigo|cod)\b\.?(?:\s+limatco)?\s*(?:(?:n[°º]|nro\.?|numero)\s*)?[:#]?\s*([a-z0-9][a-z0-9._\-\/]{2,39})/i';
+		if ( preg_match_all( $pattern, $normalized, $matches ) ) {
+			foreach ( $matches[1] as $candidate ) {
+				$candidate = rtrim( $candidate, '.-_/' );
+				if ( preg_match( '/\d/', $candidate ) && ! preg_match( '/^r\d{1,2}$/i', $candidate ) ) {
+					return array( 'sku' => $candidate, 'explicit' => true );
+				}
+			}
+		}
+
+		$bare = rtrim( $normalized, '?!. ' );
+		if ( preg_match( '/^[a-z0-9][a-z0-9._\-\/]{3,39}$/i', $bare ) && preg_match( '/\d/', $bare ) ) {
+			return array( 'sku' => $bare, 'explicit' => false );
+		}
+
+		return null;
+	}
+
+	/** Detecta pedido de ficha técnica (misma normalización que is_branches_query()). */
+	private function is_datasheet_query( $user_message ) {
+		$normalized = strtolower( remove_accents( $user_message ) );
+
+		foreach ( array( 'ficha tecnica', 'fichas tecnicas' ) as $trigger ) {
+			if ( false !== strpos( $normalized, $trigger ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Candidatos a SKU para ficha técnica: el explícito (sku/código/código limatco) y cualquier token con dígitos que no sea una medida (60x60). */
+	private function extract_datasheet_skus( $user_message ) {
+		$skus = array();
+
+		$hit = $this->extract_sku_query( $user_message );
+		if ( null !== $hit ) {
+			$skus[] = $hit['sku'];
+		}
+
+		foreach ( preg_split( '/\s+/', remove_accents( trim( $user_message ) ), -1, PREG_SPLIT_NO_EMPTY ) as $token ) {
+			$token = trim( $token, " \t.,;:!?¿¡()\"'" );
+			if ( strlen( $token ) >= 3 && strlen( $token ) <= 40 && preg_match( '/\d/', $token ) && ! preg_match( '/^\d+(?:[.,]\d+)?x\d+(?:[.,]\d+)?$/i', $token ) ) {
+				$skus[] = $token;
+			}
+		}
+
+		return array_values( array_unique( $skus ) );
+	}
+
+	/** Responde la ficha técnica copiando el campo Descripción del producto encontrado por nombre, más sus tarjetas. */
+	private function handle_datasheet( $user_message ) {
+		// Primero por SKU/código ("sku X", "código X", "código limatco X" o cualquier token con dígitos); si no, por nombre.
+		$datasheet = null;
+		foreach ( $this->extract_datasheet_skus( $user_message ) as $sku ) {
+			$found = Limatco_Chat_Context::get_datasheet_for_sku( $sku );
+			if ( '' !== $found['name'] ) {
+				$datasheet = $found;
+				break;
+			}
+		}
+		if ( null === $datasheet ) {
+			$datasheet = Limatco_Chat_Context::get_datasheet_for_query( $user_message );
+		}
+
+		if ( '' === $datasheet['name'] ) {
+			$reply = empty( Limatco_Chat_Context::extract_name_tokens( $user_message ) )
+				? '¿De qué producto necesitas la ficha técnica? Indícame el nombre o el código (SKU) del producto.'
+				: 'No encontré un producto con ese nombre o código en nuestro catálogo. Revisa los datos e inténtalo de nuevo, o llama a la Central de Cotizaciones: +56 2 2938 1410.';
+			return new WP_REST_Response(
+				array(
+					'reply'        => $this->markdown_to_html( $reply ),
+					'products'     => array(),
+					'search_links' => array(),
+				),
+				200
+			);
+		}
+
+		$body = '' !== $datasheet['text'] ? $datasheet['text'] : 'Este producto no tiene ficha técnica cargada en la web.';
+		$url  = add_query_arg( array( 'utm_source' => 'limatco', 'utm_medium' => 'chatbot' ), $datasheet['url'] );
+
+		$reply = '**Ficha técnica: ' . $datasheet['name'] . "**\n" . $body . "\n\n[Ver producto](" . $url . ')';
+		if ( count( $datasheet['products'] ) > 1 ) {
+			$reply .= "\n\nTambién encontré otros productos con ese nombre, los ves en las tarjetas de abajo.";
+		}
+
+		return new WP_REST_Response(
+			array(
+				'reply'        => $this->markdown_to_html( $reply ),
+				'products'     => $datasheet['products'],
+				'search_links' => array(),
+			),
+			200
+		);
+	}
+
+	/** Detecta intención de "solo productos en oferta" (oferta/rebaja/descuento/remate). Mismo patrón normalizado que is_branches_query(). */
+	private function is_sale_query( $user_message ) {
+		$normalized = strtolower( remove_accents( $user_message ) );
+
+		$sale_triggers = array(
+			'oferta',
+			'ofertas',
+			'rebaja',
+			'rebajas',
+			'descuento',
+			'descuentos',
+			'remate',
+			'remates',
+		);
+		foreach ( $sale_triggers as $trigger ) {
+			if ( false !== strpos( $normalized, $trigger ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Detecta intención de "ordenar de más barato a más caro" (económico/barato, incluye "X más barato"/"menor precio"). */
+	private function is_cheap_query( $user_message ) {
+		$normalized = strtolower( remove_accents( $user_message ) );
+
+		$cheap_triggers = array(
+			'economico',
+			'economica',
+			'economicos',
+			'economicas',
+			'barato',
+			'barata',
+			'baratos',
+			'baratas',
+			'menor precio',
+			'mas bajo precio',
+			'precio mas bajo',
+		);
+		foreach ( $cheap_triggers as $trigger ) {
+			if ( false !== strpos( $normalized, $trigger ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function check_rate_limit() {
+		$ip  = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : 'unknown';
+		$key = 'lac_rl_' . md5( $ip );
+
+		$count = (int) get_transient( $key );
+		if ( $count >= 20 ) {
+			return new WP_Error( 'lac_rate_limited', 'Demasiadas consultas, intenta de nuevo en un momento.' );
+		}
+
+		set_transient( $key, $count + 1, MINUTE_IN_SECONDS );
+		return true;
+	}
+}
