@@ -333,6 +333,7 @@
 					renderProductCards( result.data.products );
 					renderSeeMoreCard( result.data.search_links );
 				}
+				renderSources( result.data.sources );
 			} )
 			.catch( function () {
 				loadingEl.remove();
@@ -380,6 +381,34 @@
 		sendMessage( message );
 	} );
 	
+	// Chips de fuentes (groundingMetadata.groundingChunks) al pie del mensaje. Reusa clases de see-more.
+	function renderSources( sources ) {
+		if ( ! sources || ! sources.length ) { return; }
+		var wrapper = document.createElement( 'div' );
+		wrapper.className = 'lac-see-more-card';
+
+		var title = document.createElement( 'p' );
+		title.className = 'lac-see-more-title';
+		title.textContent = 'Fuentes';
+		wrapper.appendChild( title );
+
+		var row = document.createElement( 'div' );
+		row.className = 'lac-see-more-row';
+		sources.forEach( function ( src ) {
+			var a = document.createElement( 'a' );
+			a.className   = 'lac-see-more-link lac-see-more-combined';
+			a.href        = src.url;
+			a.target      = '_blank';
+			a.rel         = 'noopener';
+			a.textContent = src.title;
+			row.appendChild( a );
+		} );
+
+		wrapper.appendChild( row );
+		messagesEl.appendChild( wrapper );
+		messagesEl.scrollTop = messagesEl.scrollHeight;
+	}
+
 	// Tarjeta final "¿Quieres ver más?" con enlaces a la categoría y/o atributos para ver más
 	function renderSeeMoreCard( links ) {
 		if ( ! links || ! links.length ) { return; }

@@ -1,0 +1,196 @@
+--- a/assets/js/chat-widget.js
++++ b/assets/js/chat-widget.js
+@@ -333,6 +333,7 @@
+ 					renderProductCards( result.data.products );
+ 					renderSeeMoreCard( result.data.search_links );
+ 				}
++				renderSources( result.data.sources );
+ 			} )
+ 			.catch( function () {
+ 				loadingEl.remove();
+@@ -380,6 +381,34 @@
+ 		sendMessage( message );
+ 	} );
+ 	
++	// Chips de fuentes (groundingMetadata.groundingChunks) al pie del mensaje. Reusa clases de see-more.
++	function renderSources( sources ) {
++		if ( ! sources || ! sources.length ) { return; }
++		var wrapper = document.createElement( 'div' );
++		wrapper.className = 'lac-see-more-card';
++
++		var title = document.createElement( 'p' );
++		title.className = 'lac-see-more-title';
++		title.textContent = 'Fuentes';
++		wrapper.appendChild( title );
++
++		var row = document.createElement( 'div' );
++		row.className = 'lac-see-more-row';
++		sources.forEach( function ( src ) {
++			var a = document.createElement( 'a' );
++			a.className   = 'lac-see-more-link lac-see-more-combined';
++			a.href        = src.url;
++			a.target      = '_blank';
++			a.rel         = 'noopener';
++			a.textContent = src.title;
++			row.appendChild( a );
++		} );
++
++		wrapper.appendChild( row );
++		messagesEl.appendChild( wrapper );
++		messagesEl.scrollTop = messagesEl.scrollHeight;
++	}
++
+ 	// Tarjeta final "¿Quieres ver más?" con enlaces a la categoría y/o atributos para ver más
+ 	function renderSeeMoreCard( links ) {
+ 		if ( ! links || ! links.length ) { return; }
+diff --git a/includes/class-limatco-chat-api.php b/includes/class-limatco-chat-api.php
+index 1a894ee..5a2ddc7 100644
+--- a/includes/class-limatco-chat-api.php
++++ b/includes/class-limatco-chat-api.php
+@@ -10,6 +10,9 @@ class Limatco_Chat_Api {
+ 	// Endpoint Gemini compatible con OpenAI: mismo formato de "messages" y respuesta en choices[0].message.content.
+ 	const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+ 
++	// Endpoint nativo: el endpoint OpenAI-compat no soporta google_search ni devuelve groundingMetadata.
++	const GEMINI_NATIVE_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent';
++
+ 	// Instrucciones de formato para la respuesta final (no para la clasificación). Se agregan al prompt de sistema junto con el contexto de productos.
+ 	const RESPONSE_FORMAT_INSTRUCTIONS = "IMPORTANTE — esta regla de formato tiene prioridad sobre cualquier instrucción de listar/enlazar/agrupar productos que pueda venir en el prompt de sistema de arriba: cuando el contexto de abajo SÍ incluya productos encontrados, NO los listes ni los enumeres en tu respuesta (nada de viñetas, encabezados por marca, ni nombre/link/precio de cada uno): esos datos ya se muestran automáticamente como tarjetas visuales con imagen, precio y stock justo debajo de tu mensaje, así que repetirlos en texto es redundante. En ese caso responde en 1-3 frases, en prosa natural: resume brevemente qué encontraste (material, estilo, cuántas opciones) y, si corresponde, guía al usuario con una pregunta de seguimiento sobre su necesidad. Usa Markdown solo para énfasis simple (negrita), nunca para listas de productos ni links a productos. Si el contexto indica que NO se encontraron productos, explica eso con naturalidad y ofrece ayudar a acotar la búsqueda.";
+ 
+@@ -308,7 +311,7 @@ class Limatco_Chat_Api {
+ 		// Debug completo de mensajes de IA, incluye Query, Clasificacion, Prompt, Historial, resultados, finalizacion, safety y respuesta.
+ 		$messages    = $this->build_messages( $history, $user_message );
+ 		$t_start     = microtime( true );
+-		$gemini_result = $this->call_gemini_api( $api_key, $model, $full_system, $messages, 1200 );
++		$gemini_result = $this->call_gemini_search_api( $api_key, $model, $full_system, $messages, 1200 );
+ 		$t_elapsed   = round( microtime( true ) - $t_start, 2 );
+ 
+ 		// [01]-[10] structured debug log
+@@ -467,6 +470,7 @@ class Limatco_Chat_Api {
+ 				'reply'        => $this->markdown_to_html( $response ),
+ 				'products'     => $context_data['products'],
+ 				'search_links' => $search_links,
++				'sources'      => $this->extract_grounding_sources( $gemini_result['grounding'] ?? array() ),
+ 			),
+ 			200
+ 		);
+@@ -740,6 +744,119 @@ class Limatco_Chat_Api {
+ 
+ 	return implode( '', $out );
+ }
++	/** Respuesta final con Google Search grounding (endpoint nativo). Misma forma de retorno que call_gemini_api() + 'grounding' (groundingMetadata). El clasificador NO usa búsqueda. */
++	private function call_gemini_search_api( $api_key, $model, $system_prompt, $messages, $max_tokens ) {
++		$host     = wp_parse_url( home_url(), PHP_URL_HOST );
++		$contents = array();
++		foreach ( $messages as $message ) {
++			$contents[] = array(
++				'role'  => ( 'assistant' === $message['role'] ) ? 'model' : 'user',
++				'parts' => array( array( 'text' => $message['content'] ) ),
++			);
++		}
++
++		$body = array(
++			'systemInstruction' => array(
++				'parts' => array( array( 'text' => $system_prompt . "\n\n--- Google Search: toda consulta debe llevar site:{$host}. Usa SOLO información de páginas de {$host}; ignora cualquier otro sitio. Si {$host} no tiene la respuesta, dilo y no inventes ni uses conocimiento externo sobre precios, stock o productos." ) ),
++			),
++			'contents'          => $contents,
++			'tools'             => array( array( 'google_search' => new stdClass() ) ), // stdClass: debe serializar como {} y no [].
++			'generationConfig'  => array( 'maxOutputTokens' => $max_tokens ),
++		);
++
++		$response = wp_remote_post(
++			sprintf( self::GEMINI_NATIVE_ENDPOINT, rawurlencode( $model ) ),
++			array(
++				'headers' => array(
++					'x-goog-api-key' => $api_key,
++					'content-type'   => 'application/json',
++				),
++				'body'    => wp_json_encode( $body ),
++				'timeout' => 45,
++			)
++		);
++
++		if ( is_wp_error( $response ) ) {
++			return $response;
++		}
++
++		$status = wp_remote_retrieve_response_code( $response );
++		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
++
++		if ( $status < 200 || $status >= 300 ) {
++			return new WP_Error(
++				'lac_api_error',
++				isset( $data['error']['message'] ) ? $data['error']['message'] : 'Error desconocido al llamar a la API.',
++				array(
++					'http_code' => $status,
++					'api_code'  => isset( $data['error']['code'] ) ? $data['error']['code'] : 'N/A',
++					'status'    => isset( $data['error']['status'] ) ? $data['error']['status'] : 'lac_api_error',
++				)
++			);
++		}
++
++		$candidate = $data['candidates'][0] ?? array();
++		$text      = '';
++		foreach ( $candidate['content']['parts'] ?? array() as $part ) {
++			$text .= $part['text'] ?? '';
++		}
++
++		if ( '' === trim( $text ) ) {
++			return new WP_Error( 'lac_empty_reply', 'La API no devolvió texto.' );
++		}
++
++		// 'raw' imita la forma OpenAI para que los logs [06]-[08] sigan funcionando sin tocarlos.
++		return array(
++			'text'      => $text,
++			'raw'       => array(
++				'choices'        => array( array( 'finish_reason' => $candidate['finishReason'] ?? 'N/A', 'message' => array( 'content' => $text ) ) ),
++				'usage'          => array( 'completion_tokens' => $data['usageMetadata']['candidatesTokenCount'] ?? 'N/A' ),
++				'promptFeedback' => $data['promptFeedback'] ?? array(),
++			),
++			'grounding' => $candidate['groundingMetadata'] ?? array(),
++		);
++	}
++
++	/** groundingMetadata.groundingChunks[].web -> [{title,url}]. Los uri son redirects de Google: se resuelven y SOLO se conservan los que terminan en el dominio del sitio (máx. 3). Título = título real del post/producto vía url_to_postid(). */
++	private function extract_grounding_sources( $grounding ) {
++		$host    = preg_replace( '/^www\./', '', (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
++		$sources = array();
++		foreach ( array_slice( $grounding['groundingChunks'] ?? array(), 0, 6 ) as $chunk ) {
++			$uri = $chunk['web']['uri'] ?? '';
++			if ( '' === $uri || false === stripos( $chunk['web']['title'] ?? '', $host ) ) {
++				continue;
++			}
++
++			$res = wp_remote_get( $uri, array( 'redirection' => 0, 'timeout' => 3 ) );
++			$url = is_wp_error( $res ) ? '' : wp_remote_retrieve_header( $res, 'location' );
++			if ( ! is_string( $url ) || '' === $url ) {
++				continue;
++			}
++
++			$url_host = preg_replace( '/^www\./', '', (string) wp_parse_url( $url, PHP_URL_HOST ) );
++			if ( $url_host !== $host ) {
++				continue;
++			}
++
++			$url = esc_url_raw( remove_query_arg( array( 'utm_source', 'utm_medium' ), $url ) );
++			if ( isset( $sources[ $url ] ) ) {
++				continue;
++			}
++
++			$post_id = url_to_postid( $url );
++			$label   = $post_id ? get_the_title( $post_id ) : sanitize_text_field( $chunk['web']['title'] );
++
++			$sources[ $url ] = array(
++				'title' => wp_strip_all_tags( $label ),
++				'url'   => add_query_arg( array( 'utm_source' => 'limatco', 'utm_medium' => 'chatbot' ), $url ),
++			);
++			if ( count( $sources ) >= 3 ) {
++				break;
++			}
++		}
++		return array_values( $sources );
++	}
++
+ 	/** Llamada genérica a la API de Gemini, reutilizada para clasificar (paso 1) y responder (paso 3). el prompt de sistema va como un mensaje más dentro de "messages", con role:"system". */
+ 	private function call_gemini_api( $api_key, $model, $system_prompt, $messages, $max_tokens ) {
+ 		$full_messages = array();
